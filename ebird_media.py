@@ -92,6 +92,16 @@ class Photo:
     def image_url(self, size: int = 1200) -> str:
         return f"https://cdn.download.ams.birds.cornell.edu/api/v2/asset/{self.asset_id}/{size}"
 
+    @property
+    def rating_display(self) -> str:
+        if not self.rating:
+            return ""
+        text = f"{self.rating}/5"
+        if self.rating_count:
+            plural = "s" if self.rating_count != 1 else ""
+            text += f" ({self.rating_count} rating{plural})"
+        return text
+
     def metadata_fields(self, *, markdown: bool = True) -> list[tuple[str, str]]:
         """(label, value) pairs for every non-empty metadata detail."""
         coords = ""
@@ -101,18 +111,12 @@ class Photo:
                 f"[{plain}](https://www.google.com/maps/search/?api=1"
                 f"&query={self.latitude},{self.longitude})"
             ) if markdown else plain
-        rating = ""
-        if self.rating:
-            rating = f"{self.rating}/5"
-            if self.rating_count:
-                plural = "s" if self.rating_count != 1 else ""
-                rating += f" ({self.rating_count} rating{plural})"
         fields = [
             ("Observed", " · ".join(bit for bit in (self.obs_date, self.obs_time) if bit)),
             ("Location", self.location),
             ("Coordinates", coords),
             ("Age / sex", self.age_sex),
-            ("Rating", rating),
+            ("Rating", self.rating_display),
             ("Size", f"{self.width} × {self.height} px" if self.width and self.height else ""),
             ("License", self.license_id),
             ("Species code", self.species_code),
@@ -368,6 +372,8 @@ async def _main(argv: list[str]) -> int:
         if details.checklist_id:
             print(f"  Checklist: https://ebird.org/checklist/{details.checklist_id}")
         if compact:
+            if photo.rating_display:
+                print(f"  Rating: {photo.rating_display}")
             return 0
         for label, value in photo.metadata_fields(markdown=False):
             print(f"  {label}: {value}")
