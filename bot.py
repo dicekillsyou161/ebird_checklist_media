@@ -9,9 +9,11 @@ from discord import app_commands
 from dotenv import load_dotenv
 
 from ebird_media import (
+    COMPACT_FLAG,
+    VERBOSE_FLAG,
     ChecklistError,
     Photo,
-    extract_vvv,
+    extract_flags,
     fetch_asset_details,
     fetch_checklist_photos,
     parse_asset_id,
@@ -63,11 +65,17 @@ async def on_ready() -> None:
     print(f"Logged in as {bot.user} — /checklist is ready")
 
 
-def build_embed(photo: Photo, *, verbose: bool = False) -> discord.Embed:
+def build_embed(
+    photo: Photo, *, verbose: bool = False, checklist_id: str = ""
+) -> discord.Embed:
     lines = []
     if photo.sci_name:
         lines.append(f"*{photo.sci_name}*")
     lines.append(f"[macaulaylibrary.org/asset/{photo.asset_id}]({photo.asset_url})")
+    if checklist_id:
+        lines.append(f"[ebird.org/checklist/{checklist_id}](https://ebird.org/checklist/{checklist_id})")
+    if photo.unconfirmed:
+        lines.append("⚠️ *Unconfirmed — pending eBird review*")
     embed = discord.Embed(
         title=photo.common_name,
         url=photo.asset_url,
@@ -93,7 +101,8 @@ def build_embed(photo: Photo, *, verbose: bool = False) -> discord.Embed:
 )
 async def checklist_command(interaction: discord.Interaction, checklist: str) -> None:
     await interaction.response.defer()
-    verbose, rest = extract_vvv(checklist.split())
+    flags, rest = extract_flags(checklist.split())
+    verbose = VERBOSE_FLAG in flags and COMPACT_FLAG not in flags
     try:
         sub_id = parse_checklist_id(" ".join(rest))
         photos = await fetch_checklist_photos(sub_id)
@@ -137,14 +146,25 @@ async def checklist_command(interaction: discord.Interaction, checklist: str) ->
     name="checkmedia",
     description="Post one Macaulay Library photo with all its metadata, including camera EXIF",
 )
-@app_commands.describe(media="Macaulay Library asset link or ML number, e.g. ML662698120")
+@app_commands.describe(
+    media="Macaulay Library asset link or ML number, e.g. ML662698120 — prefix with -ccc for species+links only"
+)
 async def checkmedia_command(interaction: discord.Interaction, media: str) -> None:
     await interaction.response.defer()
+    flags, rest = extract_flags(media.split())
+    compact = COMPACT_FLAG in flags
     try:
-        asset_id = parse_asset_id(media)
+        asset_id = parse_asset_id(" ".join(rest))
         details = await fetch_asset_details(asset_id)
     except ChecklistError as error:
         await interaction.followup.send(str(error))
+        return
+
+    if compact:
+        embed = build_embed(details.photo, checklist_id=details.checklist_id)
+        if details.media_type and details.media_type != "photo":
+            embed.set_image(url=None)
+        await interaction.followup.send(embed=embed)
         return
 
     embed = build_embed(details.photo, verbose=True)
