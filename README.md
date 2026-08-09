@@ -60,6 +60,31 @@ take up to an hour on first run.
 
 Prints every public photo with its species and Macaulay Library link.
 
+## Run as a systemd service
+
+The repo ships [ebird-discord-bot.service](ebird-discord-bot.service), written
+for a deployment at `/opt/ebird-discord-bot` running as the `ebird` user —
+edit the `WorkingDirectory`, `ExecStart`, and `User` lines to match your
+setup. `.env` is read from `WorkingDirectory`, so it must sit in the checkout
+alongside `bot.py`, readable by the service user (and ideally `chmod 600`).
+
+```sh
+sudo useradd --system --shell /usr/bin/nologin ebird   # once, if it doesn't exist
+sudo cp ebird-discord-bot.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ebird-discord-bot
+journalctl -u ebird-discord-bot -f                          # follow logs
+```
+
+The unit restarts the bot on crashes (10 s delay) but backs off for 5 minutes
+after 5 rapid failures, so a missing or revoked token won't hot-loop.
+
+To run it as a *user* service instead (no root): remove the `User=` line,
+change `WantedBy=multi-user.target` to `default.target`, install the file to
+`~/.config/systemd/user/`, then `systemctl --user enable --now
+ebird-discord-bot` and `loginctl enable-linger $USER` so it keeps running
+without an open session.
+
 ## How it works
 
 - Photo metadata comes from the public JSON search API behind
