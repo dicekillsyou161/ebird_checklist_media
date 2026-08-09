@@ -21,6 +21,28 @@ counts, community rating, pixel dimensions, license ID, eBird species code,
 and any notes or tags on the asset. Verbose mode posts 5 embeds per message
 to stay inside Discord's per-message size limit.
 
+There is also `/checkmedia` for a single Macaulay Library asset:
+
+```
+/checkmedia https://macaulaylibrary.org/asset/662698120
+/checkmedia ML662698120
+/checkmedia -ccc ML662698120
+```
+
+It posts that photo with *all* its metadata in one embed — everything `-vvv`
+shows, plus a link back to the asset's checklist and the camera EXIF the
+Macaulay Library displays on the asset page: camera make/model, lens, focal
+length, exposure, shutter speed, aperture, ISO, flash, capture timestamp, and
+GPS coordinates (when the uploaded file carried them). Assets with stripped
+EXIF get a "none available" note; audio/video assets show metadata and a link
+but no image.
+
+Prefix with `-ccc` for the compact opposite: just the photo, species
+(common + scientific name), its Macaulay Library link, the checklist link,
+and the current community rating — no other metadata or EXIF fields.
+(`-ccc` also works on `/checklist`, where it produces the default embeds
+plus the rating line.)
+
 ## Setup
 
 **1. Create the Discord application**
@@ -107,6 +129,8 @@ without an open session.
 - Posts at most 50 photos per command (5 messages of 10 embeds) and links the
   checklist for the rest; fetches at most 400 via pagination.
 - Public media only — a hidden checklist comes back as "no public photos".
+- Rarities still pending eBird regional review are included (`unconfirmed=incl`
+  — the search index omits them by default) and marked "⚠️ Unconfirmed".
 - Photos are © their photographers, archived by the Macaulay Library. The bot
   links and embeds rather than copying; keep usage within the
   [Cornell Lab terms of use](https://www.birds.cornell.edu/home/terms-of-use/).
