@@ -66,7 +66,7 @@ async def on_ready() -> None:
 
 
 def build_embed(
-    photo: Photo, *, verbose: bool = False, checklist_id: str = ""
+    photo: Photo, *, verbose: bool = False, checklist_id: str = "", show_rating: bool = False
 ) -> discord.Embed:
     lines = []
     if photo.sci_name:
@@ -74,6 +74,8 @@ def build_embed(
     lines.append(f"[macaulaylibrary.org/asset/{photo.asset_id}]({photo.asset_url})")
     if checklist_id:
         lines.append(f"[ebird.org/checklist/{checklist_id}](https://ebird.org/checklist/{checklist_id})")
+    if show_rating and photo.rating_display:
+        lines.append(f"⭐ {photo.rating_display}")
     if photo.unconfirmed:
         lines.append("⚠️ *Unconfirmed — pending eBird review*")
     embed = discord.Embed(
@@ -102,7 +104,8 @@ def build_embed(
 async def checklist_command(interaction: discord.Interaction, checklist: str) -> None:
     await interaction.response.defer()
     flags, rest = extract_flags(checklist.split())
-    verbose = VERBOSE_FLAG in flags and COMPACT_FLAG not in flags
+    compact = COMPACT_FLAG in flags
+    verbose = VERBOSE_FLAG in flags and not compact
     try:
         sub_id = parse_checklist_id(" ".join(rest))
         photos = await fetch_checklist_photos(sub_id)
@@ -132,7 +135,7 @@ async def checklist_command(interaction: discord.Interaction, checklist: str) ->
     for start in range(0, len(shown), per_message):
         batch = shown[start:start + per_message]
         await interaction.followup.send(
-            embeds=[build_embed(photo, verbose=verbose) for photo in batch]
+            embeds=[build_embed(photo, verbose=verbose, show_rating=compact) for photo in batch]
         )
 
     if len(photos) > MAX_PHOTOS_POSTED:
@@ -161,7 +164,7 @@ async def checkmedia_command(interaction: discord.Interaction, media: str) -> No
         return
 
     if compact:
-        embed = build_embed(details.photo, checklist_id=details.checklist_id)
+        embed = build_embed(details.photo, checklist_id=details.checklist_id, show_rating=True)
         if details.media_type and details.media_type != "photo":
             embed.set_image(url=None)
         await interaction.followup.send(embed=embed)
