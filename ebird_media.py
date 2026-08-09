@@ -14,6 +14,7 @@ Run standalone to test without Discord:
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import sys
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ from dataclasses import dataclass
 import aiohttp
 
 API_URL = "https://media.ebird.org/api/v2/search"
+ASSET_PAGE = "https://macaulaylibrary.org/asset/{asset_id}"
 USER_AGENT = "ebird-checklist-discord-bot/1.0"
 PAGE_SIZE = 100
 MAX_PHOTOS = 400  # safety cap so one request can't paginate forever
@@ -28,6 +30,31 @@ VERBOSE_FLAG = "-vvv"
 
 _CHECKLIST_RE = re.compile(r"\bS(\d{4,})\b", re.IGNORECASE)
 _AGE_SEX_RE = re.compile(r"(adult|immature|juvenile|unknown)(Female|Male|Unknown)Count")
+_ASSET_URL_RE = re.compile(r"asset/(\d{5,})", re.IGNORECASE)
+_ASSET_ML_RE = re.compile(r"\bML(\d{5,})\b", re.IGNORECASE)
+_ASSET_BARE_RE = re.compile(r"\b(\d{5,})\b")
+
+# The asset page embeds parsed EXIF as {description:"…",exifTagCode:"…"} pairs
+# inside its minified Nuxt state. A pair whose value the minifier hoisted into
+# a variable (rare) is simply skipped.
+_EXIF_ARRAY_RE = re.compile(r"[\"']?exif[\"']?:\[")
+_EXIF_PAIR_RE = re.compile(r'\{description:"((?:[^"\\]|\\.)*)",exifTagCode:"([a-z0-9_]+)"\}')
+_EXIF_LABELS = {
+    "make": "Camera make",
+    "model": "Camera model",
+    "lens_model": "Lens",
+    "focal_length": "Focal length",
+    "exposure_time": "Exposure",
+    "shutter_speed": "Shutter speed",
+    "f_number": "Aperture",
+    "iso": "ISO",
+    "flash": "Flash",
+    "create_dt": "Taken",
+    "latitude": "GPS latitude",
+    "longitude": "GPS longitude",
+}
+_EXIF_ORDER = list(_EXIF_LABELS)
+_EXIF_SKIP = {"width", "height"}  # already shown via the search API's Size field
 
 
 class ChecklistError(Exception):
@@ -90,6 +117,102 @@ class Photo:
             ("Tags", self.tags),
         ]
         return [(label, value) for label, value in fields if value]
+
+
+@dataclass(frozen=True)
+class AssetDetails:
+    photo: Photo
+    media_type: str
+    checklist_id: str
+    exif: tuple[tuple[str, str], ...]  # (label, value) camera metadata
+
+
+def parse_asset_id(text: str) -> int:
+    """Accept a Macaulay Library asset URL, an ML number, or bare digits."""
+    for pattern in (_ASSET_URL_RE, _ASSET_ML_RE):
+        match = pattern.search(text)
+        if match:
+            return int(match.group(1))
+    if _CHECKLIST_RE.search(text):
+        raise ChecklistError(
+            "That looks like an eBird *checklist* — use `/checklist` for those. "
+            "This wants a Macaulay Library asset, e.g. "
+            "`https://macaulaylibrary.org/asset/662698120` or `ML662698120`."
+        )
+    match = _ASSET_BARE_RE.search(text)
+    if match:
+        return int(match.group(1))
+    raise ChecklistError(
+        "Couldn't find a Macaulay Library asset in that. Pass a link like "
+        "`https://macaulaylibrary.org/asset/662698120`, or `ML662698120`."
+    )
+
+
+def _extract_exif(page_html: str) -> tuple[tuple[str, str], ...]:
+    match = _EXIF_ARRAY_RE.search(page_html)
+    if not match:
+        return ()
+    window = page_html[match.end():match.end() + 8000]
+    tags: dict[str, str] = {}
+    for raw_desc, code in _EXIF_PAIR_RE.findall(window):
+        if code not in _EXIF_SKIP:
+            tags.setdefault(code, json.loads(f'"{raw_desc}"'))
+    ordered = [c for c in _EXIF_ORDER if c in tags] + [c for c in tags if c not in _EXIF_ORDER]
+    return tuple(
+        (_EXIF_LABELS.get(code, code.replace("_", " ").capitalize()), tags[code])
+        for code in ordered
+    )
+
+
+async def fetch_asset_details(
+    asset_id: int, *, session: aiohttp.ClientSession | None = None
+) -> AssetDetails:
+    """Look up one Macaulay Library asset: search-API metadata + page EXIF."""
+    owns_session = session is None
+    if owns_session:
+        session = aiohttp.ClientSession()
+    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
+    try:
+        async with session.get(
+            API_URL, params={"assetId": str(asset_id)}, headers=headers,
+            timeout=aiohttp.ClientTimeout(total=25),
+        ) as resp:
+            if resp.status != 200:
+                raise ChecklistError(
+                    f"Macaulay Library search returned HTTP {resp.status} — try again in a minute."
+                )
+            page = await resp.json(content_type=None)
+        # the API silently ignores unknown params, so confirm we got *this* asset
+        item = None
+        if isinstance(page, list):
+            item = next((it for it in page if it.get("assetId") == asset_id), None)
+        if item is None:
+            raise ChecklistError(
+                f"No public Macaulay Library asset `ML{asset_id}` found — "
+                "it may be restricted, deleted, or the number may be wrong."
+            )
+        exif: tuple[tuple[str, str], ...] = ()
+        try:
+            async with session.get(
+                ASSET_PAGE.format(asset_id=asset_id),
+                headers={"User-Agent": USER_AGENT},
+                timeout=aiohttp.ClientTimeout(total=25),
+            ) as resp:
+                if resp.status == 200:
+                    exif = _extract_exif(await resp.text())
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            pass  # camera metadata is best-effort; the base details still stand
+        return AssetDetails(
+            photo=_to_photo(item),
+            media_type=item.get("mediaType") or "",
+            checklist_id=item.get("ebirdChecklistId") or "",
+            exif=exif,
+        )
+    except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+        raise ChecklistError(f"Couldn't reach Macaulay Library ({error.__class__.__name__}).") from error
+    finally:
+        if owns_session:
+            await session.close()
 
 
 def extract_vvv(tokens: list[str]) -> tuple[bool, list[str]]:
@@ -214,8 +337,24 @@ async def fetch_checklist_photos(
 async def _main(argv: list[str]) -> int:
     verbose, args = extract_vvv(argv)
     if len(args) != 1:
-        print("usage: python ebird_media.py [-vvv] <checklist URL or ID>", file=sys.stderr)
+        print(
+            "usage: python ebird_media.py [-vvv] <checklist URL/ID | ML asset URL/number>",
+            file=sys.stderr,
+        )
         return 2
+    if _ASSET_URL_RE.search(args[0]) or _ASSET_ML_RE.search(args[0]):
+        details = await fetch_asset_details(parse_asset_id(args[0]))
+        photo = details.photo
+        print(f"ML{photo.asset_id}  {photo.common_name}  ({details.media_type})  {photo.asset_url}")
+        for label, value in photo.metadata_fields(markdown=False):
+            print(f"  {label}: {value}")
+        if details.checklist_id:
+            print(f"  Checklist: https://ebird.org/checklist/{details.checklist_id}")
+        for label, value in details.exif:
+            print(f"  [camera] {label}: {value}")
+        if not details.exif:
+            print("  [camera] no camera metadata available")
+        return 0
     sub_id = parse_checklist_id(args[0])
     photos = await fetch_checklist_photos(sub_id)
     print(f"{len(photos)} public photo(s) on https://ebird.org/checklist/{sub_id}")
