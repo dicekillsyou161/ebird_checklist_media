@@ -12,7 +12,9 @@ from ebird_media import (
     ChecklistError,
     Photo,
     extract_vvv,
+    fetch_asset_details,
     fetch_checklist_photos,
+    parse_asset_id,
     parse_checklist_id,
 )
 
@@ -40,7 +42,15 @@ class ChecklistBot(discord.Client):
             for guild_id in tokens:
                 guild = discord.Object(id=int(guild_id))
                 self.tree.copy_global_to(guild=guild)
-                await self.tree.sync(guild=guild)
+                try:
+                    await self.tree.sync(guild=guild)
+                except discord.Forbidden:
+                    print(
+                        f"Can't register commands in server {guild_id}: the bot either "
+                        "isn't in that server or was invited without the "
+                        "applications.commands scope. Re-invite it with the OAuth URL "
+                        "from the README (scope=bot+applications.commands), then restart."
+                    )
         else:
             await self.tree.sync()
 
@@ -121,6 +131,41 @@ async def checklist_command(interaction: discord.Interaction, checklist: str) ->
             f"…showing the first {MAX_PHOTOS_POSTED} of {len(photos)} photos — "
             f"see the rest at <{checklist_url}>"
         )
+
+
+@bot.tree.command(
+    name="checkmedia",
+    description="Post one Macaulay Library photo with all its metadata, including camera EXIF",
+)
+@app_commands.describe(media="Macaulay Library asset link or ML number, e.g. ML662698120")
+async def checkmedia_command(interaction: discord.Interaction, media: str) -> None:
+    await interaction.response.defer()
+    try:
+        asset_id = parse_asset_id(media)
+        details = await fetch_asset_details(asset_id)
+    except ChecklistError as error:
+        await interaction.followup.send(str(error))
+        return
+
+    embed = build_embed(details.photo, verbose=True)
+    if details.media_type and details.media_type != "photo":
+        # audio/video assets have no still image; the link plays the media
+        embed.set_image(url=None)
+        embed.add_field(name="Media type", value=details.media_type, inline=True)
+    if details.checklist_id:
+        embed.add_field(
+            name="Checklist",
+            value=f"[{details.checklist_id}](https://ebird.org/checklist/{details.checklist_id})",
+            inline=True,
+        )
+    if details.exif:
+        for label, value in details.exif:
+            if len(embed.fields) >= 25:  # Discord's per-embed field limit
+                break
+            embed.add_field(name=f"📷 {label}", value=value[:1024], inline=True)
+    else:
+        embed.add_field(name="📷 Camera metadata", value="None available for this asset", inline=False)
+    await interaction.followup.send(embed=embed)
 
 
 def main() -> None:
