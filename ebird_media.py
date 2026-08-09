@@ -26,7 +26,9 @@ ASSET_PAGE = "https://macaulaylibrary.org/asset/{asset_id}"
 USER_AGENT = "ebird-checklist-discord-bot/1.0"
 PAGE_SIZE = 100
 MAX_PHOTOS = 400  # safety cap so one request can't paginate forever
-VERBOSE_FLAG = "-vvv"
+VERBOSE_FLAG = "-vvv"   # add every metadata detail
+COMPACT_FLAG = "-ccc"   # cut to species + links only
+FLAGS = {VERBOSE_FLAG, COMPACT_FLAG}
 
 _CHECKLIST_RE = re.compile(r"\bS(\d{4,})\b", re.IGNORECASE)
 _AGE_SEX_RE = re.compile(r"(adult|immature|juvenile|unknown)(Female|Male|Unknown)Count")
@@ -70,6 +72,7 @@ class Photo:
     obs_date: str
     location: str
     rating: int | None
+    unconfirmed: bool = False  # rarity still pending eBird regional review
     rating_count: int | None = None
     species_code: str = ""
     license_id: str = ""
@@ -174,7 +177,9 @@ async def fetch_asset_details(
     headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
     try:
         async with session.get(
-            API_URL, params={"assetId": str(asset_id)}, headers=headers,
+            API_URL,
+            params={"assetId": str(asset_id), "unconfirmed": "incl"},
+            headers=headers,
             timeout=aiohttp.ClientTimeout(total=25),
         ) as resp:
             if resp.status != 200:
@@ -215,10 +220,11 @@ async def fetch_asset_details(
             await session.close()
 
 
-def extract_vvv(tokens: list[str]) -> tuple[bool, list[str]]:
-    """Split a -vvv verbose flag out of user-supplied tokens."""
-    rest = [token for token in tokens if token != VERBOSE_FLAG]
-    return len(rest) != len(tokens), rest
+def extract_flags(tokens: list[str]) -> tuple[set[str], list[str]]:
+    """Split recognized flags (-vvv, -ccc) out of user-supplied tokens."""
+    present = {token for token in tokens if token in FLAGS}
+    rest = [token for token in tokens if token not in FLAGS]
+    return present, rest
 
 
 def parse_checklist_id(text: str) -> str:
@@ -267,6 +273,7 @@ def _to_photo(item: dict) -> Photo:
         obs_date=item.get("obsDtDisplay") or "",
         location=", ".join(bit for bit in place_bits if bit),
         rating=item.get("rating"),
+        unconfirmed=item.get("valid") is False,
         rating_count=item.get("ratingCount"),
         species_code=taxonomy.get("speciesCode") or "",
         license_id=item.get("licenseId") or "",
@@ -301,7 +308,14 @@ async def fetch_checklist_photos(
         items: list[dict] = []
         cursor: str | None = None
         while len(items) < MAX_PHOTOS:
-            params = {"subId": sub_id, "mediaType": "photo", "count": str(PAGE_SIZE)}
+            # unconfirmed=incl keeps rarities that are still pending review,
+            # which the search index otherwise omits
+            params = {
+                "subId": sub_id,
+                "mediaType": "photo",
+                "count": str(PAGE_SIZE),
+                "unconfirmed": "incl",
+            }
             if cursor:
                 params["initialCursorMark"] = cursor
             async with session.get(
@@ -335,21 +349,28 @@ async def fetch_checklist_photos(
 
 
 async def _main(argv: list[str]) -> int:
-    verbose, args = extract_vvv(argv)
+    flags, args = extract_flags(argv)
+    verbose = VERBOSE_FLAG in flags
+    compact = COMPACT_FLAG in flags
     if len(args) != 1:
         print(
-            "usage: python ebird_media.py [-vvv] <checklist URL/ID | ML asset URL/number>",
+            "usage: python ebird_media.py [-vvv | -ccc] <checklist URL/ID | ML asset URL/number>",
             file=sys.stderr,
         )
         return 2
     if _ASSET_URL_RE.search(args[0]) or _ASSET_ML_RE.search(args[0]):
         details = await fetch_asset_details(parse_asset_id(args[0]))
         photo = details.photo
-        print(f"ML{photo.asset_id}  {photo.common_name}  ({details.media_type})  {photo.asset_url}")
-        for label, value in photo.metadata_fields(markdown=False):
-            print(f"  {label}: {value}")
+        flag = "  [UNCONFIRMED]" if photo.unconfirmed else ""
+        print(f"ML{photo.asset_id}  {photo.common_name}  ({details.media_type}){flag}  {photo.asset_url}")
+        if photo.sci_name:
+            print(f"  {photo.sci_name}")
         if details.checklist_id:
             print(f"  Checklist: https://ebird.org/checklist/{details.checklist_id}")
+        if compact:
+            return 0
+        for label, value in photo.metadata_fields(markdown=False):
+            print(f"  {label}: {value}")
         for label, value in details.exif:
             print(f"  [camera] {label}: {value}")
         if not details.exif:
@@ -359,7 +380,8 @@ async def _main(argv: list[str]) -> int:
     photos = await fetch_checklist_photos(sub_id)
     print(f"{len(photos)} public photo(s) on https://ebird.org/checklist/{sub_id}")
     for photo in photos:
-        print(f"  ML{photo.asset_id}  {photo.common_name:<30} {photo.asset_url}")
+        flag = "  [UNCONFIRMED]" if photo.unconfirmed else ""
+        print(f"  ML{photo.asset_id}  {photo.common_name:<30} {photo.asset_url}{flag}")
         if verbose:
             for label, value in photo.metadata_fields(markdown=False):
                 print(f"      {label}: {value}")
