@@ -47,9 +47,11 @@ cp .env.example .env    # paste your DISCORD_TOKEN; optionally set GUILD_ID
 .venv/bin/python bot.py
 ```
 
-Set `GUILD_ID` in `.env` (Server Settings → copy server ID) to make the
-command appear instantly in that server; without it, global registration can
-take up to an hour on first run.
+Set `GUILD_ID` in `.env` (right-click the server → Copy Server ID, with
+Developer Mode on) to make the command appear instantly in that server —
+comma-separate several IDs to register in multiple servers. Without it, the
+command registers globally in every server the bot has joined, which can take
+up to an hour on first run.
 
 ## Test the fetcher without Discord
 
@@ -69,7 +71,7 @@ setup. `.env` is read from `WorkingDirectory`, so it must sit in the checkout
 alongside `bot.py`, readable by the service user (and ideally `chmod 600`).
 
 ```sh
-sudo useradd --system --shell /usr/bin/nologin ebird   # once, if it doesn't exist
+sudo useradd --system --shell /usr/sbin/nologin ebird   # once, if it doesn't exist
 sudo cp ebird-discord-bot.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now ebird-discord-bot
