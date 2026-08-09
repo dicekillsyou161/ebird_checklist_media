@@ -1,0 +1,20 @@
+[Unit]
+Description=eBird checklist photos Discord bot
+After=network-online.target
+Wants=network-online.target
+# stop retrying for 5 min after 5 rapid failures (e.g. missing/bad token)
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Point both paths at your checkout; .env is read from WorkingDirectory
+WorkingDirectory=/opt/ebird-discord-bot
+ExecStart=/opt/ebird-discord-bot/.venv/bin/python bot.py
+User=ebird
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
