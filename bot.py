@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 
 import discord
 from discord import app_commands
@@ -30,12 +31,16 @@ class ChecklistBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self) -> None:
-        guild_id = os.getenv("GUILD_ID")
-        if guild_id:
-            # Register instantly in one server; global sync can take up to an hour.
-            guild = discord.Object(id=int(guild_id))
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
+        raw = os.getenv("GUILD_ID", "")
+        tokens = [token for token in re.split(r"[,\s]+", raw) if token]
+        if not all(token.isdigit() for token in tokens):
+            raise SystemExit(f"GUILD_ID must be numeric server IDs (comma-separated), got: {raw!r}")
+        if tokens:
+            # Register instantly in these servers; global sync can take up to an hour.
+            for guild_id in tokens:
+                guild = discord.Object(id=int(guild_id))
+                self.tree.copy_global_to(guild=guild)
+                await self.tree.sync(guild=guild)
         else:
             await self.tree.sync()
 
