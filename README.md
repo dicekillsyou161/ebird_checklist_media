@@ -37,11 +37,19 @@ GPS coordinates (when the uploaded file carried them). Assets with stripped
 EXIF get a "none available" note; audio/video assets show metadata and a link
 but no image.
 
-Prefix with `-ccc` for the compact opposite: just the photo, species
-(common + scientific name), its Macaulay Library link, the checklist link,
-and the current community rating — no other metadata or EXIF fields.
-(`-ccc` also works on `/checklist`, where it produces the default embeds
-plus the rating line.)
+Compact flags trim the embed down — more c's, more cut. All three keep the
+photo, species (common + scientific name), the Macaulay Library link, the
+checklist link, and the current community rating:
+
+| Flag   | Extra fields shown                                              |
+|--------|-----------------------------------------------------------------|
+| `-c`   | 📷 Focal length, 📷 Shutter speed, 📷 Aperture, 📷 ISO, Observed, Location |
+| `-cc`  | 📷 Focal length, Observed, Location                             |
+| `-ccc` | none                                                            |
+
+If several are given, the most-compact wins. On `/checklist`, any compact
+flag produces the default embeds plus the rating line (per-photo camera
+fields would need one page fetch per photo, so they're `/checkmedia`-only).
 
 ## Setup
 
