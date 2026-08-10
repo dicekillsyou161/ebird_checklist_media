@@ -9,7 +9,6 @@ from discord import app_commands
 from dotenv import load_dotenv
 
 from ebird_media import (
-    COMPACT_FLAG,
     VERBOSE_FLAG,
     ChecklistError,
     Photo,
@@ -18,6 +17,8 @@ from ebird_media import (
     fetch_checklist_photos,
     parse_asset_id,
     parse_checklist_id,
+    pick_compact_flag,
+    select_fields,
 )
 
 load_dotenv()
@@ -102,7 +103,7 @@ def build_embed(
 async def checklist_command(interaction: discord.Interaction, checklist: str) -> None:
     await interaction.response.defer()
     flags, rest = extract_flags(checklist.split())
-    compact = COMPACT_FLAG in flags
+    compact = pick_compact_flag(flags) is not None
     verbose = VERBOSE_FLAG in flags and not compact
     try:
         sub_id = parse_checklist_id(" ".join(rest))
@@ -146,12 +147,12 @@ async def checklist_command(interaction: discord.Interaction, checklist: str) ->
     description="Post one Macaulay Library photo with all its metadata, including camera EXIF",
 )
 @app_commands.describe(
-    media="Macaulay Library asset link or ML number, e.g. ML662698120 — prefix with -ccc for species+links only"
+    media="Macaulay Library asset link or ML number — flags -c, -cc, -ccc trim the metadata (see README)"
 )
 async def checkmedia_command(interaction: discord.Interaction, media: str) -> None:
     await interaction.response.defer()
     flags, rest = extract_flags(media.split())
-    compact = COMPACT_FLAG in flags
+    compact_flag = pick_compact_flag(flags)
     try:
         asset_id = parse_asset_id(" ".join(rest))
         details = await fetch_asset_details(asset_id)
@@ -159,10 +160,13 @@ async def checkmedia_command(interaction: discord.Interaction, media: str) -> No
         await interaction.followup.send(str(error))
         return
 
-    if compact:
+    if compact_flag:
         embed = build_embed(details.photo, checklist_id=details.checklist_id, show_rating=True)
         if details.media_type and details.media_type != "photo":
             embed.set_image(url=None)
+        for label, value, is_camera in select_fields(details, compact_flag):
+            name = f"📷 {label}" if is_camera else label
+            embed.add_field(name=name, value=value[:1024], inline=True)
         await interaction.followup.send(embed=embed)
         return
 
