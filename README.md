@@ -13,13 +13,13 @@ and a link to each photo's Macaulay Library page.
 Each photo is its own embed: the title links to the Macaulay Library asset
 page, the description repeats the link in copyable form, and the footer
 carries the ML catalog number and photographer credit. Photos are grouped by
-species, 10 embeds per message.
+species and posted one message per photo, so each can be forwarded
+individually.
 
 Prefix the checklist with `-vvv` to attach each photo's full metadata to its
 embed: observed date/time, location, coordinates (linked to a map), age/sex
 counts, community rating, pixel dimensions, license ID, eBird species code,
-and any notes or tags on the asset. Verbose mode posts 5 embeds per message
-to stay inside Discord's per-message size limit.
+and any notes or tags on the asset.
 
 There is also `/checkmedia` for a single Macaulay Library asset:
 
@@ -126,8 +126,9 @@ without an open session.
 
 ## Limits and notes
 
-- Posts at most 50 photos per command (5 messages of 10 embeds) and links the
-  checklist for the rest; fetches at most 400 via pagination.
+- Posts at most 50 photos per command (one message each) and links the
+  checklist for the rest; fetches at most 400 via pagination. Large batches
+  post gradually as Discord's rate limits allow.
 - Public media only — a hidden checklist comes back as "no public photos".
 - Rarities still pending eBird regional review are included (`unconfirmed=incl`
   — the search index omits them by default) and marked "⚠️ Unconfirmed".
