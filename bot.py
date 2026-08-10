@@ -22,9 +22,7 @@ from ebird_media import (
 
 load_dotenv()
 
-EMBEDS_PER_MESSAGE = 10          # Discord's per-message embed limit
-EMBEDS_PER_MESSAGE_VERBOSE = 5   # metadata fields add length; stay under the 6000-char/message cap
-MAX_PHOTOS_POSTED = 50           # keep one command from flooding a channel
+MAX_PHOTOS_POSTED = 50  # keep one command from flooding a channel
 FIELD_VALUE_MAX = 300            # display cap for one metadata value (Discord allows 1024)
 EMBED_COLOR = discord.Color.from_str("#4a7628")  # eBird green
 
@@ -130,12 +128,10 @@ async def checklist_command(interaction: discord.Interaction, checklist: str) ->
         f"{species_count} species · {' · '.join(detail_bits)}\n<{checklist_url}>"
     )
 
-    shown = photos[:MAX_PHOTOS_POSTED]
-    per_message = EMBEDS_PER_MESSAGE_VERBOSE if verbose else EMBEDS_PER_MESSAGE
-    for start in range(0, len(shown), per_message):
-        batch = shown[start:start + per_message]
+    # one message per photo so each can be forwarded individually
+    for photo in photos[:MAX_PHOTOS_POSTED]:
         await interaction.followup.send(
-            embeds=[build_embed(photo, verbose=verbose, show_rating=compact) for photo in batch]
+            embed=build_embed(photo, verbose=verbose, show_rating=compact)
         )
 
     if len(photos) > MAX_PHOTOS_POSTED:
