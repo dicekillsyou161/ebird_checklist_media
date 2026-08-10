@@ -26,9 +26,30 @@ ASSET_PAGE = "https://macaulaylibrary.org/asset/{asset_id}"
 USER_AGENT = "ebird-checklist-discord-bot/1.0"
 PAGE_SIZE = 100
 MAX_PHOTOS = 400  # safety cap so one request can't paginate forever
-VERBOSE_FLAG = "-vvv"   # add every metadata detail
-COMPACT_FLAG = "-ccc"   # cut to species + links only
-FLAGS = {VERBOSE_FLAG, COMPACT_FLAG}
+VERBOSE_FLAG = "-vvv"          # add every metadata detail
+COMPACT_CAMERA_FLAG = "-c"     # compact + key camera settings + observed/location
+COMPACT_BRIEF_FLAG = "-cc"     # compact + focal length + observed/location
+COMPACT_FLAG = "-ccc"          # cut to species + links + rating only
+FLAGS = {VERBOSE_FLAG, COMPACT_CAMERA_FLAG, COMPACT_BRIEF_FLAG, COMPACT_FLAG}
+
+# What each partial-compact flag adds on top of the species+links+rating base.
+# ("camera", …) labels come from the asset page EXIF; ("base", …) from the search API.
+COMPACT_SELECTIONS = {
+    COMPACT_CAMERA_FLAG: (
+        ("camera", "Focal length"),
+        ("camera", "Shutter speed"),
+        ("camera", "Aperture"),
+        ("camera", "ISO"),
+        ("base", "Observed"),
+        ("base", "Location"),
+    ),
+    COMPACT_BRIEF_FLAG: (
+        ("camera", "Focal length"),
+        ("base", "Observed"),
+        ("base", "Location"),
+    ),
+    COMPACT_FLAG: (),
+}
 
 _CHECKLIST_RE = re.compile(r"\bS(\d{4,})\b", re.IGNORECASE)
 _AGE_SEX_RE = re.compile(r"(adult|immature|juvenile|unknown)(Female|Male|Unknown)Count")
@@ -225,10 +246,30 @@ async def fetch_asset_details(
 
 
 def extract_flags(tokens: list[str]) -> tuple[set[str], list[str]]:
-    """Split recognized flags (-vvv, -ccc) out of user-supplied tokens."""
+    """Split recognized flags (-vvv, -c, -cc, -ccc) out of user-supplied tokens."""
     present = {token for token in tokens if token in FLAGS}
     rest = [token for token in tokens if token not in FLAGS]
     return present, rest
+
+
+def pick_compact_flag(flags: set[str]) -> str | None:
+    """The compact-family flag to honor; the most-compact one wins if several."""
+    for flag in (COMPACT_FLAG, COMPACT_BRIEF_FLAG, COMPACT_CAMERA_FLAG):
+        if flag in flags:
+            return flag
+    return None
+
+
+def select_fields(details: AssetDetails, flag: str) -> list[tuple[str, str, bool]]:
+    """(label, value, is_camera) rows for a partial-compact selection, skipping absent data."""
+    base = dict(details.photo.metadata_fields(markdown=False))
+    camera = dict(details.exif)
+    rows = []
+    for source, label in COMPACT_SELECTIONS.get(flag, ()):
+        value = (camera if source == "camera" else base).get(label)
+        if value:
+            rows.append((label, value, source == "camera"))
+    return rows
 
 
 def parse_checklist_id(text: str) -> str:
@@ -355,10 +396,10 @@ async def fetch_checklist_photos(
 async def _main(argv: list[str]) -> int:
     flags, args = extract_flags(argv)
     verbose = VERBOSE_FLAG in flags
-    compact = COMPACT_FLAG in flags
+    compact_flag = pick_compact_flag(flags)
     if len(args) != 1:
         print(
-            "usage: python ebird_media.py [-vvv | -ccc] <checklist URL/ID | ML asset URL/number>",
+            "usage: python ebird_media.py [-vvv | -c | -cc | -ccc] <checklist URL/ID | ML asset URL/number>",
             file=sys.stderr,
         )
         return 2
@@ -371,9 +412,12 @@ async def _main(argv: list[str]) -> int:
             print(f"  {photo.sci_name}")
         if details.checklist_id:
             print(f"  Checklist: https://ebird.org/checklist/{details.checklist_id}")
-        if compact:
+        if compact_flag:
             if photo.rating_display:
                 print(f"  Rating: {photo.rating_display}")
+            for label, value, is_camera in select_fields(details, compact_flag):
+                prefix = "[camera] " if is_camera else ""
+                print(f"  {prefix}{label}: {value}")
             return 0
         for label, value in photo.metadata_fields(markdown=False):
             print(f"  {label}: {value}")
