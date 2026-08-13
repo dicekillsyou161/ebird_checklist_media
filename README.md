@@ -51,14 +51,15 @@ If several are given, the most-compact wins. On `/checklist`, any compact
 flag produces the default embeds plus the rating line (per-photo camera
 fields would need one page fetch per photo, so they're `/checkmedia`-only).
 
-Finally, `/top` posts a user's 10 highest-rated photos (Macaulay's
+Finally, `/top` posts a user's highest-rated photos (Macaulay's
 "Best quality" ranking, `sort=rating_rank_desc`), one message per photo,
-with the same embeds and compact flags as `/checkmedia`:
+with the same embeds and compact flags as `/checkmedia`. The optional
+`count` parameter picks how many (1–50, default 10):
 
 ```
 /top USER8940126
 /top ML662698120          (any asset by that person — resolves the photographer)
-/top -cc USER8940126
+/top -cc USER8940126 count:5
 ```
 
 Identify the user by their `USER…` ID (click any photographer name on
