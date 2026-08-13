@@ -56,6 +56,8 @@ _AGE_SEX_RE = re.compile(r"(adult|immature|juvenile|unknown)(Female|Male|Unknown
 _ASSET_URL_RE = re.compile(r"asset/(\d{5,})", re.IGNORECASE)
 _ASSET_ML_RE = re.compile(r"\bML(\d{5,})\b", re.IGNORECASE)
 _ASSET_BARE_RE = re.compile(r"\b(\d{5,})\b")
+_USER_ID_RE = re.compile(r"\bUSER(\d+)\b", re.IGNORECASE)
+_PROFILE_URL_RE = re.compile(r"/profile/[A-Za-z0-9_\-=%]+")
 
 # The asset page embeds parsed EXIF as {description:"…",exifTagCode:"…"} pairs
 # inside its minified Nuxt state. A pair whose value the minifier hoisted into
@@ -92,7 +94,7 @@ class Photo:
     photographer: str
     obs_date: str
     location: str
-    rating: int | None
+    rating: float | None
     unconfirmed: bool = False  # rarity still pending eBird regional review
     rating_count: int | None = None
     species_code: str = ""
@@ -117,7 +119,7 @@ class Photo:
     def rating_display(self) -> str:
         if not self.rating:
             return ""
-        text = f"{self.rating}/5"
+        text = f"{round(self.rating, 1):g}/5"
         if self.rating_count:
             plural = "s" if self.rating_count != 1 else ""
             text += f" ({self.rating_count} rating{plural})"
@@ -192,6 +194,54 @@ def _extract_exif(page_html: str) -> tuple[tuple[str, str], ...]:
     )
 
 
+async def _search(session: aiohttp.ClientSession, **params) -> list[dict]:
+    """One call to the media search API, returning the raw item list."""
+    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
+    query = {key: str(value) for key, value in params.items()}
+    async with session.get(
+        API_URL, params=query, headers=headers, timeout=aiohttp.ClientTimeout(total=25)
+    ) as resp:
+        if resp.status != 200:
+            raise ChecklistError(
+                f"Macaulay Library search returned HTTP {resp.status} — try again in a minute."
+            )
+        if "json" not in (resp.headers.get("Content-Type") or ""):
+            raise ChecklistError(
+                "Macaulay Library returned a non-JSON response "
+                "(possibly an anti-bot challenge — see README notes on the User-Agent)."
+            )
+        page = await resp.json()
+    if not isinstance(page, list):
+        raise ChecklistError("Unexpected response shape from Macaulay Library search.")
+    return page
+
+
+async def _fetch_exif(
+    session: aiohttp.ClientSession, asset_id: int
+) -> tuple[tuple[str, str], ...]:
+    """Camera metadata from the asset page; best-effort, empty on any failure."""
+    try:
+        async with session.get(
+            ASSET_PAGE.format(asset_id=asset_id),
+            headers={"User-Agent": USER_AGENT},
+            timeout=aiohttp.ClientTimeout(total=25),
+        ) as resp:
+            if resp.status == 200:
+                return _extract_exif(await resp.text())
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        pass
+    return ()
+
+
+def _item_to_details(item: dict, exif: tuple[tuple[str, str], ...]) -> AssetDetails:
+    return AssetDetails(
+        photo=_to_photo(item),
+        media_type=item.get("mediaType") or "",
+        checklist_id=item.get("ebirdChecklistId") or "",
+        exif=exif,
+    )
+
+
 async def fetch_asset_details(
     asset_id: int, *, session: aiohttp.ClientSession | None = None
 ) -> AssetDetails:
@@ -199,45 +249,88 @@ async def fetch_asset_details(
     owns_session = session is None
     if owns_session:
         session = aiohttp.ClientSession()
-    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
     try:
-        async with session.get(
-            API_URL,
-            params={"assetId": str(asset_id), "unconfirmed": "incl"},
-            headers=headers,
-            timeout=aiohttp.ClientTimeout(total=25),
-        ) as resp:
-            if resp.status != 200:
-                raise ChecklistError(
-                    f"Macaulay Library search returned HTTP {resp.status} — try again in a minute."
-                )
-            page = await resp.json(content_type=None)
+        page = await _search(session, assetId=asset_id, unconfirmed="incl")
         # the API silently ignores unknown params, so confirm we got *this* asset
-        item = None
-        if isinstance(page, list):
-            item = next((it for it in page if it.get("assetId") == asset_id), None)
+        item = next((it for it in page if it.get("assetId") == asset_id), None)
         if item is None:
             raise ChecklistError(
                 f"No public Macaulay Library asset `ML{asset_id}` found — "
                 "it may be restricted, deleted, or the number may be wrong."
             )
-        exif: tuple[tuple[str, str], ...] = ()
-        try:
-            async with session.get(
-                ASSET_PAGE.format(asset_id=asset_id),
-                headers={"User-Agent": USER_AGENT},
-                timeout=aiohttp.ClientTimeout(total=25),
-            ) as resp:
-                if resp.status == 200:
-                    exif = _extract_exif(await resp.text())
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            pass  # camera metadata is best-effort; the base details still stand
-        return AssetDetails(
-            photo=_to_photo(item),
-            media_type=item.get("mediaType") or "",
-            checklist_id=item.get("ebirdChecklistId") or "",
-            exif=exif,
+        return _item_to_details(item, await _fetch_exif(session, asset_id))
+    except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+        raise ChecklistError(f"Couldn't reach Macaulay Library ({error.__class__.__name__}).") from error
+    finally:
+        if owns_session:
+            await session.close()
+
+
+async def resolve_user(text: str, *, session: aiohttp.ClientSession) -> str:
+    """Turn user input into a USER… ID: accepts the ID itself, bare digits,
+    or any Macaulay Library asset link/number by that person."""
+    match = _USER_ID_RE.search(text)
+    if match:
+        return f"USER{match.group(1)}"
+    if _PROFILE_URL_RE.search(text):
+        raise ChecklistError(
+            "eBird profile pages need a sign-in, so I can't read the user ID from "
+            "that link. Pass one of their Macaulay Library asset links instead "
+            "(e.g. `ML662698120`), or their `USER…` ID."
         )
+    if _ASSET_URL_RE.search(text) or _ASSET_ML_RE.search(text):
+        asset_id = parse_asset_id(text)
+        page = await _search(session, assetId=asset_id, unconfirmed="incl")
+        item = next((it for it in page if it.get("assetId") == asset_id), None)
+        if item and item.get("userId"):
+            return item["userId"]
+        raise ChecklistError(f"Couldn't find the photographer of `ML{asset_id}`.")
+    digits = re.fullmatch(r"\s*(\d{4,})\s*", text)
+    if digits:
+        return f"USER{digits.group(1)}"
+    raise ChecklistError(
+        "Couldn't work out an eBird user from that. Pass their `USER…` ID or "
+        "one of their Macaulay Library asset links (e.g. `ML662698120`)."
+    )
+
+
+async def fetch_top_details(
+    user_ref: str,
+    *,
+    count: int = 10,
+    include_exif: bool = True,
+    session: aiohttp.ClientSession | None = None,
+) -> tuple[str, str, list[AssetDetails]]:
+    """A user's highest-rated public photos (Macaulay 'Best quality' ranking).
+
+    Returns (display_name, user_id, details). EXIF fetches are skipped when
+    the caller won't show camera fields.
+    """
+    owns_session = session is None
+    if owns_session:
+        session = aiohttp.ClientSession()
+    try:
+        user_id = await resolve_user(user_ref, session=session)
+        items = (await _search(
+            session,
+            userId=user_id,
+            mediaType="photo",
+            sort="rating_rank_desc",
+            count=count,
+            unconfirmed="incl",
+        ))[:count]
+        if include_exif and items:
+            semaphore = asyncio.Semaphore(4)
+
+            async def grab(item: dict) -> tuple[tuple[str, str], ...]:
+                async with semaphore:
+                    return await _fetch_exif(session, item["assetId"])
+
+            exifs = await asyncio.gather(*(grab(item) for item in items))
+        else:
+            exifs = [()] * len(items)
+        name = (items[0].get("userDisplayName") if items else "") or user_id
+        return name, user_id, [_item_to_details(i, e) for i, e in zip(items, exifs)]
     except (aiohttp.ClientError, asyncio.TimeoutError) as error:
         raise ChecklistError(f"Couldn't reach Macaulay Library ({error.__class__.__name__}).") from error
     finally:
@@ -348,7 +441,6 @@ async def fetch_checklist_photos(
     owns_session = session is None
     if owns_session:
         session = aiohttp.ClientSession()
-    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
     try:
         items: list[dict] = []
         cursor: str | None = None
@@ -363,22 +455,7 @@ async def fetch_checklist_photos(
             }
             if cursor:
                 params["initialCursorMark"] = cursor
-            async with session.get(
-                API_URL, params=params, headers=headers,
-                timeout=aiohttp.ClientTimeout(total=25),
-            ) as resp:
-                if resp.status != 200:
-                    raise ChecklistError(
-                        f"Macaulay Library search returned HTTP {resp.status} — try again in a minute."
-                    )
-                if "json" not in (resp.headers.get("Content-Type") or ""):
-                    raise ChecklistError(
-                        "Macaulay Library returned a non-JSON response "
-                        "(possibly an anti-bot challenge — see README notes on the User-Agent)."
-                    )
-                page = await resp.json()
-            if not isinstance(page, list):
-                raise ChecklistError("Unexpected response shape from Macaulay Library search.")
+            page = await _search(session, **params)
             items.extend(page)
             if len(page) < PAGE_SIZE:
                 break
@@ -403,6 +480,14 @@ async def _main(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 2
+    if _USER_ID_RE.search(args[0]) or _PROFILE_URL_RE.search(args[0]):
+        name, user_id, all_details = await fetch_top_details(args[0], include_exif=False)
+        print(f"Top {len(all_details)} rated photos by {name} ({user_id})")
+        for details in all_details:
+            photo = details.photo
+            flag = "  [UNCONFIRMED]" if photo.unconfirmed else ""
+            print(f"  ML{photo.asset_id}  {photo.common_name:<28} {photo.rating_display:<12} {photo.asset_url}{flag}")
+        return 0
     if _ASSET_URL_RE.search(args[0]) or _ASSET_ML_RE.search(args[0]):
         details = await fetch_asset_details(parse_asset_id(args[0]))
         photo = details.photo
