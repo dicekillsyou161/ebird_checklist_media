@@ -1,7 +1,7 @@
-# eBird Checklist Photos — Discord Bot
+# eBird Checklist Photos: Discord Bot
 
 One slash command: give it an eBird checklist link or ID, and it posts every
-public photo from that checklist as embeds — species name, the image itself,
+public photo from that checklist as embeds, species name, the image itself,
 and a link to each photo's Macaulay Library page.
 
 ```
@@ -29,7 +29,7 @@ There is also `/checkmedia` for a single Macaulay Library asset:
 /checkmedia -ccc ML662698120
 ```
 
-It posts that photo with *all* its metadata in one embed — everything `-vvv`
+It posts that photo with *all* its metadata in one embed; everything `-vvv`
 shows, plus a link back to the asset's checklist and the camera EXIF the
 Macaulay Library displays on the asset page: camera make/model, lens, focal
 length, exposure, shutter speed, aperture, ISO, flash, capture timestamp, and
@@ -37,7 +37,7 @@ GPS coordinates (when the uploaded file carried them). Assets with stripped
 EXIF get a "none available" note; audio/video assets show metadata and a link
 but no image.
 
-Compact flags trim the embed down — more c's, more cut. All three keep the
+Compact flags trim the embed down; more c's, more cut. All three keep the
 photo, species (common + scientific name), the Macaulay Library link, the
 checklist link, and the current community rating:
 
@@ -58,12 +58,12 @@ with the same embeds and compact flags as `/checkmedia`. The optional
 
 ```
 /top USER8940126
-/top ML662698120          (any asset by that person — resolves the photographer)
+/top ML662698120          (any asset by that person; resolves the photographer)
 /top -cc USER8940126 count:5
 ```
 
 Identify the user by their `USER…` ID (click any photographer name on
-media.ebird.org — it's the `userId=` in the URL), bare digits, or one of
+media.ebird.org; it's the `userId=` in the URL), bare digits, or one of
 their asset links. eBird *profile* URLs can't be used: those pages sit
 behind a sign-in.
 
@@ -94,7 +94,7 @@ cp .env.example .env    # paste your DISCORD_TOKEN; optionally set GUILD_ID
 ```
 
 Set `GUILD_ID` in `.env` (right-click the server → Copy Server ID, with
-Developer Mode on) to make the command appear instantly in that server —
+Developer Mode on) to make the command appear instantly in that server;
 comma-separate several IDs to register in multiple servers. Without it, the
 command registers globally in every server the bot has joined, which can take
 up to an hour on first run.
@@ -111,7 +111,7 @@ Prints every public photo with its species and Macaulay Library link.
 ## Run as a systemd service
 
 The repo ships [ebird-discord-bot.service](ebird-discord-bot.service), written
-for a deployment at `/opt/ebird-discord-bot` running as the `ebird` user —
+for a deployment at `/opt/ebird-discord-bot` running as the `ebird` user;
 edit the `WorkingDirectory`, `ExecStart`, and `User` lines to match your
 setup. `.env` is read from `WorkingDirectory`, so it must sit in the checkout
 alongside `bot.py`, readable by the service user (and ideally `chmod 600`).
@@ -141,11 +141,11 @@ without an open session.
   No API key required.
 - Images embed straight from Cornell's CDN
   (`cdn.download.ams.birds.cornell.edu/api/v2/asset/<id>/1200`), which serves
-  all clients — the bot never downloads or rehosts photos.
+  all clients; the bot never downloads or rehosts photos.
 - Cornell fronts its sites with an anti-bot challenge (Anubis) for
   **browser-like** clients. This bot sends an honest, non-browser
   `User-Agent` (`ebird-checklist-discord-bot/1.0`), which the policy lets
-  through. Don't "upgrade" it to a browser UA string — that gets challenged
+  through. Don't "upgrade" it to a browser UA string; that gets challenged
   and the API will return HTML instead of JSON.
 
 ## Limits and notes
@@ -153,9 +153,9 @@ without an open session.
 - Posts at most 50 photos per command (one message each) and links the
   checklist for the rest; fetches at most 400 via pagination. Large batches
   post gradually as Discord's rate limits allow.
-- Public media only — a hidden checklist comes back as "no public photos".
+- Public media only; a hidden checklist comes back as "no public photos".
 - Rarities still pending eBird regional review are included (`unconfirmed=incl`
-  — the search index omits them by default) and marked "⚠️ Unconfirmed".
+ ; the search index omits them by default) and marked "⚠️ Unconfirmed".
 - Photos are © their photographers, archived by the Macaulay Library. The bot
   links and embeds rather than copying; keep usage within the
   [Cornell Lab terms of use](https://www.birds.cornell.edu/home/terms-of-use/).
