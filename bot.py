@@ -200,18 +200,23 @@ def build_asset_embed(details: AssetDetails, compact_flag: str | None) -> discor
 
 @bot.tree.command(
     name="top",
-    description="Post an eBird user's top 10 highest-rated photos",
+    description="Post an eBird user's top highest-rated photos",
 )
 @app_commands.describe(
-    user="Their USER… ID or any ML asset link by them — flags -c, -cc, -ccc as in /checkmedia"
+    user="Their USER… ID or any ML asset link by them — flags -c, -cc, -ccc as in /checkmedia",
+    count="How many photos to post (1–50, default 10)",
 )
-async def top_command(interaction: discord.Interaction, user: str) -> None:
+async def top_command(
+    interaction: discord.Interaction,
+    user: str,
+    count: app_commands.Range[int, 1, 50] = 10,
+) -> None:
     await interaction.response.defer()
     flags, rest = extract_flags(user.split())
     compact_flag = pick_compact_flag(flags)
     try:
         name, user_id, all_details = await fetch_top_details(
-            " ".join(rest), include_exif=compact_flag != COMPACT_FLAG
+            " ".join(rest), count=count, include_exif=compact_flag != COMPACT_FLAG
         )
     except ChecklistError as error:
         await interaction.followup.send(str(error))
