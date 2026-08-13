@@ -14,10 +14,13 @@ from ebird_media import (
     AssetDetails,
     ChecklistError,
     Photo,
+    SORT_BEST,
+    SORT_OBS,
+    SORT_RECENT,
     extract_flags,
     fetch_asset_details,
     fetch_checklist_photos,
-    fetch_top_details,
+    fetch_user_details,
     parse_asset_id,
     parse_checklist_id,
     pick_compact_flag,
@@ -198,6 +201,35 @@ def build_asset_embed(details: AssetDetails, compact_flag: str | None) -> discor
     return embed
 
 
+async def _send_user_photos(
+    interaction: discord.Interaction, user: str, count: int, sort: str, header: str
+) -> None:
+    """Shared body of /top and /recent; `header` is formatted with n=photo count."""
+    flags, rest = extract_flags(user.split())
+    compact_flag = pick_compact_flag(flags)
+    try:
+        name, user_id, all_details = await fetch_user_details(
+            " ".join(rest), count=count, sort=sort,
+            include_exif=compact_flag != COMPACT_FLAG,
+        )
+    except ChecklistError as error:
+        await interaction.followup.send(str(error))
+        return
+    if not all_details:
+        await interaction.followup.send(
+            f"No public photos found for `{user_id}` — check the ID, "
+            "or pass one of their Macaulay Library asset links."
+        )
+        return
+
+    catalog = f"https://media.ebird.org/catalog?userId={user_id}&mediaType=photo&sort={sort}"
+    await interaction.followup.send(
+        f"**{header.format(n=len(all_details))}** · {name} · [full gallery](<{catalog}>)"
+    )
+    for details in all_details:
+        await interaction.followup.send(embed=build_asset_embed(details, compact_flag))
+
+
 @bot.tree.command(
     name="top",
     description="Post an eBird user's top highest-rated photos",
@@ -212,28 +244,33 @@ async def top_command(
     count: app_commands.Range[int, 1, 50] = 10,
 ) -> None:
     await interaction.response.defer()
-    flags, rest = extract_flags(user.split())
-    compact_flag = pick_compact_flag(flags)
-    try:
-        name, user_id, all_details = await fetch_top_details(
-            " ".join(rest), count=count, include_exif=compact_flag != COMPACT_FLAG
-        )
-    except ChecklistError as error:
-        await interaction.followup.send(str(error))
-        return
-    if not all_details:
-        await interaction.followup.send(
-            f"No public photos found for `{user_id}` — check the ID, "
-            "or pass one of their Macaulay Library asset links."
-        )
-        return
+    await _send_user_photos(interaction, user, count, SORT_BEST, "Top {n} rated photos")
 
-    catalog = f"https://media.ebird.org/catalog?userId={user_id}&mediaType=photo&sort=rating_rank_desc"
-    await interaction.followup.send(
-        f"**Top {len(all_details)} rated photos** · {name} · [full gallery](<{catalog}>)"
-    )
-    for details in all_details:
-        await interaction.followup.send(embed=build_asset_embed(details, compact_flag))
+
+@bot.tree.command(
+    name="recent",
+    description="Post an eBird user's most recently uploaded photos",
+)
+@app_commands.describe(
+    user="Their USER… ID or any ML asset link by them — flags -c, -cc, -ccc as in /checkmedia",
+    count="How many photos to post (1–50, default 10)",
+    obs="Sort by observation date/time instead of upload date",
+)
+async def recent_command(
+    interaction: discord.Interaction,
+    user: str,
+    count: app_commands.Range[int, 1, 50] = 10,
+    obs: bool = False,
+) -> None:
+    await interaction.response.defer()
+    if obs:
+        await _send_user_photos(
+            interaction, user, count, SORT_OBS, "{n} most recent photos by observation date"
+        )
+    else:
+        await _send_user_photos(
+            interaction, user, count, SORT_RECENT, "{n} most recently uploaded photos"
+        )
 
 
 def main() -> None:
