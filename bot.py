@@ -9,12 +9,15 @@ from discord import app_commands
 from dotenv import load_dotenv
 
 from ebird_media import (
+    COMPACT_FLAG,
     VERBOSE_FLAG,
+    AssetDetails,
     ChecklistError,
     Photo,
     extract_flags,
     fetch_asset_details,
     fetch_checklist_photos,
+    fetch_top_details,
     parse_asset_id,
     parse_checklist_id,
     pick_compact_flag,
@@ -160,6 +163,11 @@ async def checkmedia_command(interaction: discord.Interaction, media: str) -> No
         await interaction.followup.send(str(error))
         return
 
+    await interaction.followup.send(embed=build_asset_embed(details, compact_flag))
+
+
+def build_asset_embed(details: AssetDetails, compact_flag: str | None) -> discord.Embed:
+    """The /checkmedia-style embed for one asset, honoring the compact flags."""
     if compact_flag:
         embed = build_embed(details.photo, checklist_id=details.checklist_id, show_rating=True)
         if details.media_type and details.media_type != "photo":
@@ -167,8 +175,7 @@ async def checkmedia_command(interaction: discord.Interaction, media: str) -> No
         for label, value, is_camera in select_fields(details, compact_flag):
             name = f"📷 {label}" if is_camera else label
             embed.add_field(name=name, value=value[:1024], inline=True)
-        await interaction.followup.send(embed=embed)
-        return
+        return embed
 
     embed = build_embed(details.photo, verbose=True)
     if details.media_type and details.media_type != "photo":
@@ -188,7 +195,40 @@ async def checkmedia_command(interaction: discord.Interaction, media: str) -> No
             embed.add_field(name=f"📷 {label}", value=value[:1024], inline=True)
     else:
         embed.add_field(name="📷 Camera metadata", value="None available for this asset", inline=False)
-    await interaction.followup.send(embed=embed)
+    return embed
+
+
+@bot.tree.command(
+    name="top",
+    description="Post an eBird user's top 10 highest-rated photos",
+)
+@app_commands.describe(
+    user="Their USER… ID or any ML asset link by them — flags -c, -cc, -ccc as in /checkmedia"
+)
+async def top_command(interaction: discord.Interaction, user: str) -> None:
+    await interaction.response.defer()
+    flags, rest = extract_flags(user.split())
+    compact_flag = pick_compact_flag(flags)
+    try:
+        name, user_id, all_details = await fetch_top_details(
+            " ".join(rest), include_exif=compact_flag != COMPACT_FLAG
+        )
+    except ChecklistError as error:
+        await interaction.followup.send(str(error))
+        return
+    if not all_details:
+        await interaction.followup.send(
+            f"No public photos found for `{user_id}` — check the ID, "
+            "or pass one of their Macaulay Library asset links."
+        )
+        return
+
+    catalog = f"https://media.ebird.org/catalog?userId={user_id}&mediaType=photo&sort=rating_rank_desc"
+    await interaction.followup.send(
+        f"**Top {len(all_details)} rated photos** · {name} · [full gallery](<{catalog}>)"
+    )
+    for details in all_details:
+        await interaction.followup.send(embed=build_asset_embed(details, compact_flag))
 
 
 def main() -> None:
