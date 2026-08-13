@@ -51,6 +51,21 @@ If several are given, the most-compact wins. On `/checklist`, any compact
 flag produces the default embeds plus the rating line (per-photo camera
 fields would need one page fetch per photo, so they're `/checkmedia`-only).
 
+Finally, `/top` posts a user's 10 highest-rated photos (Macaulay's
+"Best quality" ranking, `sort=rating_rank_desc`), one message per photo,
+with the same embeds and compact flags as `/checkmedia`:
+
+```
+/top USER8940126
+/top ML662698120          (any asset by that person — resolves the photographer)
+/top -cc USER8940126
+```
+
+Identify the user by their `USER…` ID (click any photographer name on
+media.ebird.org — it's the `userId=` in the URL), bare digits, or one of
+their asset links. eBird *profile* URLs can't be used: those pages sit
+behind a sign-in.
+
 ## Setup
 
 **1. Create the Discord application**
