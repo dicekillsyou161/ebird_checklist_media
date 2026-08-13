@@ -474,14 +474,17 @@ async def _main(argv: list[str]) -> int:
     flags, args = extract_flags(argv)
     verbose = VERBOSE_FLAG in flags
     compact_flag = pick_compact_flag(flags)
-    if len(args) != 1:
+    user_mode = bool(args) and bool(_USER_ID_RE.search(args[0]) or _PROFILE_URL_RE.search(args[0]))
+    if not (len(args) == 1 or (user_mode and len(args) == 2 and args[1].isdigit())):
         print(
-            "usage: python ebird_media.py [-vvv | -c | -cc | -ccc] <checklist URL/ID | ML asset URL/number>",
+            "usage: python ebird_media.py [-vvv | -c | -cc | -ccc] "
+            "<checklist URL/ID | ML asset URL/number | USER… ID [count]>",
             file=sys.stderr,
         )
         return 2
-    if _USER_ID_RE.search(args[0]) or _PROFILE_URL_RE.search(args[0]):
-        name, user_id, all_details = await fetch_top_details(args[0], include_exif=False)
+    if user_mode:
+        count = int(args[1]) if len(args) == 2 else 10
+        name, user_id, all_details = await fetch_top_details(args[0], count=count, include_exif=False)
         print(f"Top {len(all_details)} rated photos by {name} ({user_id})")
         for details in all_details:
             photo = details.photo
