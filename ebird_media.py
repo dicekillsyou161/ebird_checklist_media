@@ -23,6 +23,9 @@ import aiohttp
 
 API_URL = "https://media.ebird.org/api/v2/search"
 ASSET_PAGE = "https://macaulaylibrary.org/asset/{asset_id}"
+SORT_BEST = "rating_rank_desc"     # Macaulay "Best quality" ranking
+SORT_RECENT = "upload_date_desc"   # most recently uploaded
+SORT_OBS = "obs_date_desc"         # most recent observation date/time
 USER_AGENT = "ebird-checklist-discord-bot/1.0"
 PAGE_SIZE = 100
 MAX_PHOTOS = 400  # safety cap so one request can't paginate forever
@@ -294,14 +297,15 @@ async def resolve_user(text: str, *, session: aiohttp.ClientSession) -> str:
     )
 
 
-async def fetch_top_details(
+async def fetch_user_details(
     user_ref: str,
     *,
     count: int = 10,
     include_exif: bool = True,
+    sort: str = SORT_BEST,
     session: aiohttp.ClientSession | None = None,
 ) -> tuple[str, str, list[AssetDetails]]:
-    """A user's highest-rated public photos (Macaulay 'Best quality' ranking).
+    """A user's public photos, ranked by `sort` (best quality or most recent).
 
     Returns (display_name, user_id, details). EXIF fetches are skipped when
     the caller won't show camera fields.
@@ -315,7 +319,7 @@ async def fetch_top_details(
             session,
             userId=user_id,
             mediaType="photo",
-            sort="rating_rank_desc",
+            sort=sort,
             count=count,
             unconfirmed="incl",
         ))[:count]
@@ -475,17 +479,31 @@ async def _main(argv: list[str]) -> int:
     verbose = VERBOSE_FLAG in flags
     compact_flag = pick_compact_flag(flags)
     user_mode = bool(args) and bool(_USER_ID_RE.search(args[0]) or _PROFILE_URL_RE.search(args[0]))
-    if not (len(args) == 1 or (user_mode and len(args) == 2 and args[1].isdigit())):
+    extras_ok = user_mode and all(t.isdigit() or t.lower() in ("top", "recent", "obs") for t in args[1:])
+    if not (len(args) == 1 or (extras_ok and len(args) <= 3)):
         print(
             "usage: python ebird_media.py [-vvv | -c | -cc | -ccc] "
-            "<checklist URL/ID | ML asset URL/number | USER… ID [count]>",
+            "<checklist URL/ID | ML asset URL/number | USER… ID [count] [top|recent|obs]>",
             file=sys.stderr,
         )
         return 2
     if user_mode:
-        count = int(args[1]) if len(args) == 2 else 10
-        name, user_id, all_details = await fetch_top_details(args[0], count=count, include_exif=False)
-        print(f"Top {len(all_details)} rated photos by {name} ({user_id})")
+        count, sort = 10, SORT_BEST
+        for token in args[1:]:
+            if token.isdigit():
+                count = int(token)
+            elif token.lower() == "recent":
+                sort = SORT_RECENT
+            elif token.lower() == "obs":
+                sort = SORT_OBS
+        name, user_id, all_details = await fetch_user_details(
+            args[0], count=count, sort=sort, include_exif=False
+        )
+        kind = {
+            SORT_RECENT: "most recently uploaded",
+            SORT_OBS: "most recent by observation date",
+        }.get(sort, "top rated")
+        print(f"{len(all_details)} {kind} photos by {name} ({user_id})")
         for details in all_details:
             photo = details.photo
             flag = "  [UNCONFIRMED]" if photo.unconfirmed else ""
