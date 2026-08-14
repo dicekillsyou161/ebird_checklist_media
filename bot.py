@@ -428,8 +428,9 @@ def build_rare_digest(region_code: str, days: int, reports: list[RareReport]) ->
         location = report.location if len(report.location) <= 44 else report.location[:43] + "…"
         observer = report.observer if len(report.observer) <= 24 else report.observer[:23] + "…"
         context = " · ".join(bit for bit in (report.obs_dt, location, observer) if bit)
+        camera = " 📷" if report.details else ""
         entry = (
-            f"{report.rarity_emoji} **{report.common_name}** · {report.rarity_label}\n"
+            f"{report.rarity_emoji} **{report.common_name}**{camera} · {report.rarity_label}\n"
             f"{context} · [checklist]({report.checklist_url})"
         )
         if used + len(entry) + 2 > DIGEST_BUDGET:
@@ -442,8 +443,10 @@ def build_rare_digest(region_code: str, days: int, reports: list[RareReport]) ->
         description="\n\n".join(entries),
         color=EMBED_COLOR,
     )
+    with_photos = sum(1 for report in reports if report.details)
     embed.set_footer(
-        text=f"{len(reports)} eBird-confirmed report(s) · last {days} days · photos not required"
+        text=f"{len(reports)} eBird-confirmed report(s) · last {days} days · "
+             f"📷 = has a photo ({with_photos})"
     )
     return embed
 
