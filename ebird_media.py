@@ -27,6 +27,7 @@ API_URL = "https://media.ebird.org/api/v2/search"
 ASSET_PAGE = "https://macaulaylibrary.org/asset/{asset_id}"
 TAXON_FIND_URL = "https://api.ebird.org/v2/ref/taxon/find"
 REGION_FIND_URL = "https://api.ebird.org/v2/ref/region/find"
+REGION_LIST_URL = "https://api.ebird.org/v2/ref/region/list/{kind}/{parent}"
 SPPLIST_URL = "https://api.ebird.org/v2/product/spplist/{region_code}"
 TAXONOMY_URL = "https://api.ebird.org/v2/ref/taxonomy/ebird"
 NOTABLE_URL = "https://api.ebird.org/v2/data/obs/{region_code}/recent/notable"
@@ -394,23 +395,153 @@ def _merge_key(sort: str):
     return quality
 
 
-async def resolve_region(text: str, *, session: aiohttp.ClientSession) -> str:
-    """Turn 'US-WA' or 'washington' into an eBird region code."""
-    stripped = text.strip()
-    if _REGION_CODE_RE.fullmatch(stripped):
-        return stripped.upper()
-    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
+_REGION_LIST_CACHE: dict[tuple[str, str], list[dict]] = {}
+# words to drop when reading a place name: "king county wa" == "king wa"
+_ADMIN_WORDS = {"county", "co", "parish", "borough", "municipality", "state", "province"}
+
+
+async def _region_list(kind: str, parent: str, session: aiohttp.ClientSession) -> list[dict]:
+    """[{code, name}, …] of a region's children (cached); empty if unavailable."""
+    key = (kind, parent)
+    if key in _REGION_LIST_CACHE:
+        return _REGION_LIST_CACHE[key]
+    rows: list[dict] = []
+    try:
+        async with session.get(
+            REGION_LIST_URL.format(kind=kind, parent=parent),
+            params={"key": EBIRD_WEB_KEY},
+            headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+            timeout=aiohttp.ClientTimeout(total=25),
+        ) as resp:
+            if resp.status == 200:
+                payload = await resp.json(content_type=None)
+                if isinstance(payload, list):
+                    rows = payload
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        pass
+    _REGION_LIST_CACHE[key] = rows
+    return rows
+
+
+async def _find_regions(query: str, session: aiohttp.ClientSession) -> list[dict]:
+    """Raw fuzzy region matches; names look like 'King, Washington, United States (US)'."""
     async with session.get(
-        REGION_FIND_URL, params={"q": stripped, "key": EBIRD_WEB_KEY},
-        headers=headers, timeout=aiohttp.ClientTimeout(total=25),
+        REGION_FIND_URL, params={"q": query, "key": EBIRD_WEB_KEY},
+        headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+        timeout=aiohttp.ClientTimeout(total=25),
     ) as resp:
-        if resp.status == 200:
-            matches = await resp.json(content_type=None)
-            if isinstance(matches, list) and matches:
-                return matches[0]["code"]
+        if resp.status != 200:
+            return []
+        matches = await resp.json(content_type=None)
+    return matches if isinstance(matches, list) else []
+
+
+def _first_segment(name: str) -> str:
+    return name.split(",")[0].strip().lower()
+
+
+async def _resolve_parent(part: str, session: aiohttp.ClientSession) -> str:
+    """A state/province (or country) code for 'wa', 'washington', 'new york'."""
+    text = part.strip().lower()
+    if not text:
+        return ""
+    if len(text) == 2 and text.isalpha():
+        countries = {row["code"] for row in await _region_list("country", "world", session)}
+        if text.upper() in countries:
+            return text.upper()
+        states = {row["code"] for row in await _region_list("subnational1", "US", session)}
+        if f"US-{text.upper()}" in states:  # a bare 2-letter US state abbreviation
+            return f"US-{text.upper()}"
+        return ""
+    for row in await _region_list("subnational1", "US", session):
+        if row["name"].lower() == text:
+            return row["code"]
+    for match in await _find_regions(text, session):
+        if _first_segment(match["name"]) == text and match["code"].count("-") <= 1:
+            return match["code"]
+    return ""
+
+
+async def _resolve_child(name: str, parent_code: str, session: aiohttp.ClientSession) -> str:
+    """A county/subnational2 code by name within a state."""
+    text = name.strip().lower()
+    children = await _region_list("subnational2", parent_code, session)
+    for row in children:
+        if row["name"].lower() == text:
+            return row["code"]
+    partial = [row for row in children if row["name"].lower().startswith(text)]
+    return partial[0]["code"] if len(partial) == 1 else ""
+
+
+async def resolve_region(text: str, *, session: aiohttp.ClientSession) -> str:
+    """Turn a code or place name into an eBird region code.
+
+    Accepts 'US-WA-033', 'US-WA', 'WA', 'washington', and county-with-state
+    forms like 'king county wa' or 'king county washington'.
+    """
+    raw = " ".join(text.replace(",", " ").split())
+    if not raw:
+        raise ChecklistError("Which region? Give a code (US-WA) or a name (king county wa).")
+    if "-" in raw and _REGION_CODE_RE.fullmatch(raw):
+        code = raw.upper()
+        countries = {row["code"] for row in await _region_list("country", "world", session)}
+        if countries and code.split("-")[0] not in countries:
+            raise ChecklistError(
+                f"“{raw}” isn't a valid eBird region code; codes start with a country "
+                "like US-WA or US-WA-033."
+            )
+        return code
+
+    words = [w for w in raw.lower().split()]
+    trimmed = [w for w in words if w.strip(".") not in _ADMIN_WORDS] or words
+    if len(trimmed) == 1 and len(trimmed[0]) == 2 and trimmed[0].isalpha():
+        code = await _resolve_parent(trimmed[0], session)
+        if code:
+            return code
+    # "<county> <state>": try each split, longest county name last
+    for split in range(1, len(trimmed)):
+        parent = await _resolve_parent(" ".join(trimmed[split:]), session)
+        if not parent:
+            continue
+        child = await _resolve_child(" ".join(trimmed[:split]), parent, session)
+        if child:
+            return child
+
+    # whole-name matches the finder handles badly: it ranks a same-named county
+    # above a state, and never returns countries at all
+    whole = " ".join(trimmed)
+    for row in await _region_list("subnational1", "US", session):
+        if row["name"].lower() == whole:
+            return row["code"]
+    for row in await _region_list("country", "world", session):
+        if row["name"].lower() == whole:
+            return row["code"]
+
+    matches = await _find_regions(raw, session)
+    if matches:
+        query = raw.lower()
+        ranked = sorted(
+            enumerate(matches),
+            key=lambda pair: (_first_segment(pair[1]["name"]) != query,
+                              pair[1]["code"].count("-"), pair[0]),
+        )
+        best = ranked[0][1]
+        if _first_segment(best["name"]) == query:
+            rivals = [
+                m for _, m in ranked[1:]
+                if _first_segment(m["name"]) == query
+                and m["code"].count("-") == best["code"].count("-")
+            ]
+            if rivals:
+                names = "; ".join(m["name"] for m in [best] + rivals[:4])
+                raise ChecklistError(
+                    f"“{raw}” matches several regions; add a state or use a code. "
+                    f"Candidates: {names}"
+                )
+        return best["code"]
     raise ChecklistError(
-        f"Couldn't find region “{stripped}” — use an eBird region code "
-        "(US, US-WA, US-WA-033) or a region name like “washington”."
+        f"Couldn't find region “{raw}”; use an eBird code (US, US-WA, US-WA-033), "
+        "a name like “washington”, or a county with its state like “king county wa”."
     )
 
 
@@ -854,19 +985,24 @@ async def _media_count(
 async def _rarity(
     region_code: str, species_code: str, session: aiohttp.ClientSession
 ) -> tuple[str, str, float | None, str]:
-    """(label, emoji, share, note) for how seldom a species is photographed here."""
+    """(label, emoji, share, note) for how seldom a species is photographed here.
+
+    Rarity is judged at state/province scale even for a county query: the
+    counts are far more stable, and it matches how birders rank a record.
+    """
+    scope = region_code.rsplit("-", 1)[0] if region_code.count("-") == 2 else region_code
     end_year: int | None = date.today().year - 1
-    total = (await _media_count(region_code, "", session, end_year)).get("photo") or 0
+    total = (await _media_count(scope, "", session, end_year)).get("photo") or 0
     if total < RARITY_MIN_BASELINE:
         # thin history (or a region that only recently got coverage): use everything
         end_year = None
-        total = (await _media_count(region_code, "", session)).get("photo") or 0
+        total = (await _media_count(scope, "", session)).get("photo") or 0
     if not total:
         return "Notable sighting", "⚪", None, ""
-    mine = (await _media_count(region_code, species_code, session, end_year)).get("photo") or 0
+    mine = (await _media_count(scope, species_code, session, end_year)).get("photo") or 0
     share = 100 * mine / total
     window = f"prior photo{'' if mine == 1 else 's'}" if end_year else f"photo{'' if mine == 1 else 's'}"
-    note = f"{mine:,} {window} in {region_code}"
+    note = f"{mine:,} {window} in {scope}"
     for threshold, label, emoji in RARITY_TIERS:
         if share < threshold:
             return label, emoji, share, note
