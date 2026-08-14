@@ -417,6 +417,37 @@ async def recent_command(
         )
 
 
+DIGEST_BUDGET = 3900  # leave room under Discord's 4096-char description limit
+
+
+def build_rare_digest(region_code: str, days: int, reports: list[RareReport]) -> discord.Embed:
+    """Every report condensed into one embed, no photos."""
+    entries: list[str] = []
+    used = 0
+    for report in reports:
+        location = report.location if len(report.location) <= 44 else report.location[:43] + "…"
+        observer = report.observer if len(report.observer) <= 24 else report.observer[:23] + "…"
+        context = " · ".join(bit for bit in (report.obs_dt, location, observer) if bit)
+        entry = (
+            f"{report.rarity_emoji} **{report.common_name}** · {report.rarity_label}\n"
+            f"{context} · [checklist]({report.checklist_url})"
+        )
+        if used + len(entry) + 2 > DIGEST_BUDGET:
+            entries.append(f"…and {len(reports) - len(entries)} more")
+            break
+        entries.append(entry)
+        used += len(entry) + 2
+    embed = discord.Embed(
+        title=f"Rare birds in {region_code}",
+        description="\n\n".join(entries),
+        color=EMBED_COLOR,
+    )
+    embed.set_footer(
+        text=f"{len(reports)} eBird-confirmed report(s) · last {days} days · photos not required"
+    )
+    return embed
+
+
 def build_rare_embed(report: RareReport, compact_flag: str | None) -> discord.Embed:
     """A rare-bird alert: the photo, who/where/when, and how rare it is."""
     embed = build_embed(
@@ -457,6 +488,7 @@ def build_rare_embed(report: RareReport, compact_flag: str | None) -> discord.Em
     count="How many reports to post (1–25, default 10)",
     days="How many days back to search (1–30, default 14)",
     repeats="Allow several reports of the same species (default: most recent of each)",
+    text="Text-only: drop the photo requirement and post one summary embed",
 )
 async def rare_command(
     interaction: discord.Interaction,
@@ -464,6 +496,7 @@ async def rare_command(
     count: app_commands.Range[int, 1, 25] = 10,
     days: app_commands.Range[int, 1, 30] = 14,
     repeats: bool = False,
+    text: bool = False,
 ) -> None:
     await interaction.response.defer()
     flags, rest = extract_flags(region.split())
@@ -471,19 +504,25 @@ async def rare_command(
     try:
         region_code, reports = await fetch_rare_reports(
             " ".join(rest), count=count, days=days, unique_species=not repeats,
-            include_exif=compact_flag != COMPACT_FLAG,
+            require_photo=not text,
+            include_exif=not text and compact_flag != COMPACT_FLAG,
         )
     except ChecklistError as error:
         await interaction.followup.send(str(error))
         return
     if not reports:
+        qualifier = "" if text else " with public photos"
         await interaction.followup.send(
-            f"No eBird-confirmed rarities with public photos in `{region_code}` "
+            f"No eBird-confirmed rarities{qualifier} in `{region_code}` "
             f"over the last {days} days."
         )
         return
 
-    learn_names([(r.details.photo.photographer, r.details.photo.user_id) for r in reports])
+    if text:
+        await interaction.followup.send(embed=build_rare_digest(region_code, days, reports))
+        return
+
+    learn_names([(r.details.photo.photographer, r.details.photo.user_id) for r in reports if r.details])
     plural = "ies" if len(reports) != 1 else "y"
     await interaction.followup.send(
         f"**{len(reports)} confirmed rarit{plural} with photos** · `{region_code}` · "
