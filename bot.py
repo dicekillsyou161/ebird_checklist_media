@@ -311,24 +311,33 @@ async def _send_user_photos(
     except ChecklistError as error:
         await interaction.followup.send(str(error))
         return
-    learn_names([(result.display_name, result.user_id)])
+    learn_names(
+        [(result.display_name, result.user_id)]
+        + [(d.photo.photographer, d.photo.user_id) for d in result.details]
+    )
     if not result.details:
         target = f" of {result.species_display}" if result.species_display else ""
-        await interaction.followup.send(
-            f"No public media{target} found for `{result.user_id}` — check the ID, "
-            "or pass one of their Macaulay Library asset links."
-        )
+        if result.user_id:
+            await interaction.followup.send(
+                f"No public media{target} found for `{result.user_id}` — check the ID, "
+                "or pass one of their Macaulay Library asset links."
+            )
+        else:
+            await interaction.followup.send(f"No public media{target} found.")
         return
 
-    catalog = f"https://media.ebird.org/catalog?userId={result.user_id}&sort={sort}"
+    catalog = f"https://media.ebird.org/catalog?sort={sort}"
+    if result.user_id:
+        catalog += f"&userId={result.user_id}"
     if not species:
         catalog += "&mediaType=photo"
     if result.species_code:
         catalog += f"&taxonCode={result.species_code}"
-    await interaction.followup.send(
-        f"**{header.format(n=len(result.details), sp=result.species_display)}** · "
-        f"{result.display_name} · [full gallery](<{catalog}>)"
-    )
+    bits = [f"**{header.format(n=len(result.details), sp=result.species_display)}**"]
+    if result.display_name:
+        bits.append(result.display_name)
+    bits.append(f"[full gallery](<{catalog}>)")
+    await interaction.followup.send(" · ".join(bits))
     for details in result.details:
         await interaction.followup.send(embed=build_asset_embed(details, compact_flag))
 
@@ -339,14 +348,14 @@ async def _send_user_photos(
 )
 @app_commands.describe(
     species="Species — common or scientific name, e.g. 'black oystercatcher'",
-    user="Their USER… ID or any ML asset link by them — flags -c, -cc, -ccc as in /checkmedia",
+    user="Optional: USER… ID, name, @mention, or their asset link — omit for the global best",
     count="How many to post (1–50, default 10)",
-    group="Match every species with this in its name (e.g. all warblers)",
+    group="Match every species with this in its name (e.g. all warblers; needs a user)",
 )
 async def sp_command(
     interaction: discord.Interaction,
     species: str,
-    user: str,
+    user: str = "",
     count: app_commands.Range[int, 1, 50] = 10,
     group: bool = False,
 ) -> None:
