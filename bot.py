@@ -1,8 +1,10 @@
 """Discord bot: /checklist <eBird checklist> posts every public Macaulay Library photo."""
 from __future__ import annotations
 
+import json
 import os
 import re
+from pathlib import Path
 
 import discord
 from discord import app_commands
@@ -32,6 +34,83 @@ load_dotenv()
 MAX_PHOTOS_POSTED = 50  # keep one command from flooding a channel
 FIELD_VALUE_MAX = 300            # display cap for one metadata value (Discord allows 1024)
 EMBED_COLOR = discord.Color.from_str("#4a7628")  # eBird green
+
+
+# Learned identities: Discord links (via /iam) and display names seen in any
+# command's results, so "@mention" and "Mark Zorthesosen" work as user refs.
+REGISTRY_PATH = Path(__file__).resolve().parent / "aliases.json"
+_MENTION_RE = re.compile(r"<@!?(\d+)>")
+_NAMELIKE_RE = re.compile(r"^@?[^\d:/]+$")  # words only: no digits, no URLs
+
+
+def _load_registry() -> dict:
+    try:
+        data = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
+        return {"discord": dict(data.get("discord", {})), "names": dict(data.get("names", {}))}
+    except (OSError, ValueError):
+        return {"discord": {}, "names": {}}
+
+
+_registry = _load_registry()
+
+
+def _save_registry() -> None:
+    try:
+        REGISTRY_PATH.write_text(
+            json.dumps(_registry, indent=2, sort_keys=True), encoding="utf-8"
+        )
+    except OSError as error:
+        print(f"Couldn't save {REGISTRY_PATH.name}: {error}")
+
+
+def learn_names(pairs) -> None:
+    """Remember (display name, USER… ID) pairs seen in results."""
+    changed = False
+    for display, user_id in pairs:
+        display = (display or "").strip()
+        if not display or not user_id or display == user_id:
+            continue
+        key = display.lower()
+        if _registry["names"].get(key, [None])[0] != user_id:
+            _registry["names"][key] = [user_id, display]
+            changed = True
+    if changed:
+        _save_registry()
+
+
+def resolve_alias(text: str) -> str | None:
+    """Turn a Discord @mention or a learned display name into a USER… ID.
+
+    Returns None when `text` isn't mention/name-shaped and should go to the
+    library resolver (USER IDs, asset links, digits) untouched.
+    """
+    stripped = text.strip()
+    mention = _MENTION_RE.fullmatch(stripped)
+    if mention:
+        linked = _registry["discord"].get(mention.group(1))
+        if linked:
+            return linked
+        raise ChecklistError(
+            "That Discord account isn't linked to an eBird user yet — "
+            "they can link it with `/iam` (USER… ID or one of their ML asset links)."
+        )
+    if not _NAMELIKE_RE.fullmatch(stripped):
+        return None
+    needle = stripped.lstrip("@").strip().lower()
+    names = _registry["names"]
+    if needle in names:
+        return names[needle][0]
+    hits = {tuple(entry) for key, entry in names.items() if needle in key}
+    if len(hits) == 1:
+        return next(iter(hits))[0]
+    if hits:
+        shown = "; ".join(sorted(display for _, display in hits)[:5])
+        raise ChecklistError(f"“{stripped}” matches several people I know — {shown}. Be more specific.")
+    raise ChecklistError(
+        f"I don't recognize “{stripped}” yet. Names are learned automatically — run any "
+        "command once with their `USER…` ID or one of their ML asset links, or have "
+        "them link themselves with `/iam`."
+    )
 
 
 class ChecklistBot(discord.Client):
@@ -126,6 +205,7 @@ async def checklist_command(interaction: discord.Interaction, checklist: str) ->
         )
         return
 
+    learn_names((photo.photographer, photo.user_id) for photo in photos)
     species_count = len({photo.common_name for photo in photos})
     first = photos[0]
     detail_bits = [bit for bit in (first.photographer, first.obs_date, first.location) if bit]
@@ -166,6 +246,7 @@ async def checkmedia_command(interaction: discord.Interaction, media: str) -> No
         await interaction.followup.send(str(error))
         return
 
+    learn_names([(details.photo.photographer, details.photo.user_id)])
     await interaction.followup.send(embed=build_asset_embed(details, compact_flag))
 
 
@@ -218,8 +299,10 @@ async def _send_user_photos(
         species = " ".join(species_rest)
     compact_flag = pick_compact_flag(flags)
     try:
+        user_ref = " ".join(rest)
+        user_ref = resolve_alias(user_ref) or user_ref
         result = await fetch_user_details(
-            " ".join(rest), count=count, sort=sort,
+            user_ref, count=count, sort=sort,
             include_exif=compact_flag != COMPACT_FLAG,
             species_query=species or None,
             species_group=species_group,
@@ -228,6 +311,7 @@ async def _send_user_photos(
     except ChecklistError as error:
         await interaction.followup.send(str(error))
         return
+    learn_names([(result.display_name, result.user_id)])
     if not result.details:
         target = f" of {result.species_display}" if result.species_display else ""
         await interaction.followup.send(
@@ -314,6 +398,27 @@ async def recent_command(
         await _send_user_photos(
             interaction, user, count, SORT_RECENT, "{n} most recently uploaded photos"
         )
+
+
+@bot.tree.command(
+    name="iam",
+    description="Link your Discord account to your eBird identity for @mention and name lookups",
+)
+@app_commands.describe(user="Your USER… ID or any of your Macaulay Library asset links")
+async def iam_command(interaction: discord.Interaction, user: str) -> None:
+    await interaction.response.defer(ephemeral=True)
+    try:
+        result = await fetch_user_details(user.strip(), count=1, include_exif=False)
+    except ChecklistError as error:
+        await interaction.followup.send(str(error))
+        return
+    _registry["discord"][str(interaction.user.id)] = result.user_id
+    _save_registry()
+    learn_names([(result.display_name, result.user_id)])
+    await interaction.followup.send(
+        f"Linked! You are **{result.display_name}** (`{result.user_id}`) — your @mention "
+        "and display name now work in /top, /recent, and /sp."
+    )
 
 
 def main() -> None:
