@@ -24,6 +24,9 @@ import aiohttp
 API_URL = "https://media.ebird.org/api/v2/search"
 ASSET_PAGE = "https://macaulaylibrary.org/asset/{asset_id}"
 TAXON_FIND_URL = "https://api.ebird.org/v2/ref/taxon/find"
+REGION_FIND_URL = "https://api.ebird.org/v2/ref/region/find"
+SPPLIST_URL = "https://api.ebird.org/v2/product/spplist/{region_code}"
+TAXONOMY_URL = "https://api.ebird.org/v2/ref/taxonomy/ebird"
 # eBird's own key for its public web autocomplete widgets (not a personal API key)
 EBIRD_WEB_KEY = "jfekjedvescr"
 SORT_BEST = "rating_rank_desc"     # Macaulay "Best quality" ranking
@@ -32,6 +35,7 @@ SORT_OBS = "obs_date_desc"         # most recent observation date/time
 USER_AGENT = "ebird-checklist-discord-bot/1.0"
 PAGE_SIZE = 100
 MAX_PHOTOS = 400  # safety cap so one request can't paginate forever
+GROUP_GLOBAL_MAX = 40  # most species a userless group:True search will fan out to
 VERBOSE_FLAG = "-vvv"          # add every metadata detail
 COMPACT_CAMERA_FLAG = "-c"     # compact + key camera settings + observed/location
 COMPACT_BRIEF_FLAG = "-cc"     # compact + focal length + observed/location
@@ -64,6 +68,7 @@ _ASSET_ML_RE = re.compile(r"\bML(\d{5,})\b", re.IGNORECASE)
 _ASSET_BARE_RE = re.compile(r"\b(\d{5,})\b")
 _USER_ID_RE = re.compile(r"\bUSER(\d+)\b", re.IGNORECASE)
 _PROFILE_URL_RE = re.compile(r"/profile/[A-Za-z0-9_\-=%]+")
+_REGION_CODE_RE = re.compile(r"^[A-Za-z]{2}(-[A-Za-z0-9]{1,5}){0,2}$")
 
 # The asset page embeds parsed EXIF as {description:"…",exifTagCode:"…"} pairs
 # inside its minified Nuxt state. A pair whose value the minifier hoisted into
@@ -171,6 +176,7 @@ class UserMedia:
     species_code: str     # "" when not filtered by species
     species_display: str  # e.g. "Black Oystercatcher - Haematopus bachmani"
     details: list[AssetDetails]
+    region: str = ""      # eBird region code when the search was region-limited
 
 
 def parse_asset_id(text: str) -> int:
@@ -310,14 +316,11 @@ async def resolve_user(text: str, *, session: aiohttp.ClientSession) -> str:
     )
 
 
-async def resolve_species(query: str, *, session: aiohttp.ClientSession) -> tuple[str, str]:
-    """Match a common or scientific name to (taxonCode, display name).
-
-    An exact name match wins outright; otherwise a lone hit is used as-is,
-    and multiple hits raise a did-you-mean error rather than silently
-    searching the wrong species.
-    """
-    params = {"locale": "en", "cat": "species", "limit": "25", "key": EBIRD_WEB_KEY, "q": query}
+async def _find_taxa(
+    query: str, session: aiohttp.ClientSession, *, cat: str = "species", limit: int = 25
+) -> list[dict]:
+    """Raw fuzzy taxon matches [{code, name}, …] for a name query."""
+    params = {"locale": "en", "cat": cat, "limit": str(limit), "key": EBIRD_WEB_KEY, "q": query}
     headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
     async with session.get(
         TAXON_FIND_URL, params=params, headers=headers,
@@ -326,11 +329,139 @@ async def resolve_species(query: str, *, session: aiohttp.ClientSession) -> tupl
         if resp.status != 200:
             raise ChecklistError(f"Species lookup returned HTTP {resp.status} — try again in a minute.")
         matches = await resp.json(content_type=None)
-    if not isinstance(matches, list) or not matches:
+    return matches if isinstance(matches, list) else []
+
+
+def _merge_key(sort: str):
+    """Cross-species ordering for merged global-group results."""
+    if sort == SORT_OBS:
+        return lambda item: item.get("obsDt") or ""
+    if sort == SORT_RECENT:
+        return lambda item: item.get("assetId") or 0
+
+    def quality(item: dict) -> float:
+        # approximates Macaulay's Bayesian quality rank: pull low-vote
+        # ratings toward a prior of 3.0 with weight 10
+        rating = item.get("rating") or 0
+        votes = item.get("ratingCount") or 0
+        return (rating * votes + 3.0 * 10) / (votes + 10)
+
+    return quality
+
+
+async def resolve_region(text: str, *, session: aiohttp.ClientSession) -> str:
+    """Turn 'US-WA' or 'washington' into an eBird region code."""
+    stripped = text.strip()
+    if _REGION_CODE_RE.fullmatch(stripped):
+        return stripped.upper()
+    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
+    async with session.get(
+        REGION_FIND_URL, params={"q": stripped, "key": EBIRD_WEB_KEY},
+        headers=headers, timeout=aiohttp.ClientTimeout(total=25),
+    ) as resp:
+        if resp.status == 200:
+            matches = await resp.json(content_type=None)
+            if isinstance(matches, list) and matches:
+                return matches[0]["code"]
+    raise ChecklistError(
+        f"Couldn't find region “{stripped}” — use an eBird region code "
+        "(US, US-WA, US-WA-033) or a region name like “washington”."
+    )
+
+
+_REGION_SPECIES_CACHE: dict[str, frozenset[str]] = {}
+
+
+async def _region_species(region_code: str, session: aiohttp.ClientSession) -> frozenset[str]:
+    """Species codes ever recorded in a region (cached per process)."""
+    cached = _REGION_SPECIES_CACHE.get(region_code)
+    if cached is not None:
+        return cached
+    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
+    async with session.get(
+        SPPLIST_URL.format(region_code=region_code), params={"key": EBIRD_WEB_KEY},
+        headers=headers, timeout=aiohttp.ClientTimeout(total=25),
+    ) as resp:
+        if resp.status != 200:
+            raise ChecklistError(
+                f"Unknown region `{region_code}` — use an eBird region code "
+                "(US, US-WA, US-WA-033) or a region name."
+            )
+        codes = await resp.json(content_type=None)
+    result = frozenset(codes) if isinstance(codes, list) else frozenset()
+    _REGION_SPECIES_CACHE[region_code] = result
+    return result
+
+
+_REGION_TAXA_CACHE: dict[str, list[dict]] = {}
+
+
+async def _region_taxa(region_code: str, session: aiohttp.ClientSession) -> list[dict]:
+    """[{code, name}, …] for every species recorded in a region (cached).
+
+    Built from the region's species list plus taxonomy names, because the
+    global fuzzy finder caps at 150 matches in taxonomic order — filtering
+    those by region would wrongly drop late-order families (e.g. warblers).
+    """
+    cached = _REGION_TAXA_CACHE.get(region_code)
+    if cached is not None:
+        return cached
+    codes = sorted(await _region_species(region_code, session))
+    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
+    taxa: list[dict] = []
+    for start in range(0, len(codes), 200):
+        chunk = ",".join(codes[start:start + 200])
+        async with session.get(
+            TAXONOMY_URL, params={"fmt": "json", "species": chunk, "key": EBIRD_WEB_KEY},
+            headers=headers, timeout=aiohttp.ClientTimeout(total=25),
+        ) as resp:
+            if resp.status != 200:
+                raise ChecklistError(
+                    f"Taxonomy lookup returned HTTP {resp.status} — try again in a minute."
+                )
+            rows = await resp.json(content_type=None)
+        for row in rows or []:
+            taxa.append({
+                "code": row.get("speciesCode"),
+                "name": f"{row.get('comName')} - {row.get('sciName')}",
+            })
+    _REGION_TAXA_CACHE[region_code] = taxa
+    return taxa
+
+
+async def resolve_species(
+    query: str, *, session: aiohttp.ClientSession, regional_taxa: list[dict] | None = None
+) -> tuple[str, str]:
+    """Match a common or scientific name to (taxonCode, display name).
+
+    An exact name match wins outright; otherwise a lone hit is used as-is,
+    and multiple hits raise a did-you-mean error rather than silently
+    searching the wrong species. With `regional_taxa`, candidates come from
+    that region's species first, falling back to the global list.
+    """
+    lowered = query.strip().lower()
+    if regional_taxa is not None:
+        by_common = [t for t in regional_taxa if lowered in t["name"].partition(" - ")[0].lower()]
+        by_sci = [t for t in regional_taxa if lowered in t["name"].partition(" - ")[2].lower()]
+        pool = by_common or by_sci
+        if pool:
+            for match in pool:
+                common, _, scientific = match["name"].partition(" - ")
+                if lowered in (common.lower(), scientific.lower()):
+                    return match["code"], match["name"]
+            if len(pool) == 1:
+                return pool[0]["code"], pool[0]["name"]
+            preview = "; ".join(m["name"] for m in pool[:5])
+            raise ChecklistError(
+                f"“{query}” matches {len(pool)} species in that region — use a more "
+                f"exact name, or set `group:True`. Closest matches: {preview} …"
+            )
+        # nothing in the region matched the text; fall back to the global list
+    matches = await _find_taxa(query, session)
+    if not matches:
         raise ChecklistError(
             f"No species matched “{query}” — try the exact common or scientific name."
         )
-    lowered = query.strip().lower()
     for match in matches:
         common, _, scientific = match["name"].partition(" - ")
         if lowered in (common.lower(), scientific.lower()):
@@ -347,7 +478,8 @@ async def resolve_species(query: str, *, session: aiohttp.ClientSession) -> tupl
 
 
 async def _paged_user_search(
-    session: aiohttp.ClientSession, user_id: str, *, sort: str, all_media: bool
+    session: aiohttp.ClientSession, user_id: str, *, sort: str, all_media: bool,
+    region_code: str = "",
 ) -> list[dict]:
     """Page through a user's media in server sort order, up to MAX_PHOTOS items."""
     items: list[dict] = []
@@ -356,6 +488,8 @@ async def _paged_user_search(
         params: dict = {"userId": user_id, "sort": sort, "count": PAGE_SIZE, "unconfirmed": "incl"}
         if not all_media:
             params["mediaType"] = "photo"
+        if region_code:
+            params["regionCode"] = region_code
         if cursor:
             params["initialCursorMark"] = cursor
         page = await _search(session, **params)
@@ -377,6 +511,7 @@ async def fetch_user_details(
     species_query: str | None = None,
     species_group: bool = False,
     all_media: bool = False,
+    region: str = "",
     session: aiohttp.ClientSession | None = None,
 ) -> UserMedia:
     """A user's public media, ranked by `sort`, optionally one species only.
@@ -393,26 +528,79 @@ async def fetch_user_details(
         user_id = ""
         if user_ref:
             user_id = await resolve_user(user_ref, session=session)
-        elif species_group:
-            raise ChecklistError(
-                "`group:True` scans one person's library — add a user, or use an "
-                "exact species name for a global search."
-            )
         elif not species_query:
             raise ChecklistError("Give me a user, a species, or both.")
+        region_code = ""
+        regional_taxa: list[dict] | None = None
+        if region:
+            region_code = await resolve_region(region, session=session)
+            regional_taxa = await _region_taxa(region_code, session)
         species_code = species_display = ""
-        if species_query and species_group:
+        if species_query and species_group and user_id:
             needle = species_query.strip().lower()
             species_display = f"“{species_query.strip()}”"
-            everything = await _paged_user_search(session, user_id, sort=sort, all_media=all_media)
-            items = [
+            everything = await _paged_user_search(
+                session, user_id, sort=sort, all_media=all_media, region_code=region_code
+            )
+            # prefer common-name matches so "puffin" doesn't drag in Puffinus shearwaters
+            by_common = [
                 item for item in everything
                 if needle in ((item.get("taxonomy") or {}).get("comName") or "").lower()
-                or needle in ((item.get("taxonomy") or {}).get("sciName") or "").lower()
-            ][:count]
+            ]
+            by_sci = [
+                item for item in everything
+                if needle in ((item.get("taxonomy") or {}).get("sciName") or "").lower()
+            ]
+            items = (by_common or by_sci)[:count]
+        elif species_query and species_group:
+            # global group: one query per matched species, merged and re-ranked
+            needle = species_query.strip().lower()
+            if regional_taxa is not None:
+                candidates = regional_taxa
+            else:
+                candidates = await _find_taxa(species_query, session, cat="species,spuh", limit=150)
+                if not candidates:
+                    raise ChecklistError(
+                        f"No species matched “{species_query}” — try the exact common or scientific name."
+                    )
+            # prefer common-name matches so "puffin" doesn't drag in Puffinus shearwaters
+            by_common = [m for m in candidates if needle in m["name"].partition(" - ")[0].lower()]
+            by_sci = [m for m in candidates if needle in m["name"].partition(" - ")[2].lower()]
+            named = by_common or by_sci
+            if not named:
+                if regional_taxa is not None:
+                    raise ChecklistError(
+                        f"No species matching “{species_query}” has been recorded in `{region_code}`."
+                    )
+                named = candidates
+            if len(named) > GROUP_GLOBAL_MAX:
+                more = "+" if len(candidates) == 150 else ""
+                raise ChecklistError(
+                    f"“{species_query}” is too broad for a group search here "
+                    f"({len(named)}{more} taxa match) — add a user, narrow the group, "
+                    "or use a smaller region."
+                )
+            species_display = f"“{species_query.strip()}” ({len(named)} taxa)"
+            semaphore = asyncio.Semaphore(4)
+
+            async def one_taxon(code: str) -> list[dict]:
+                async with semaphore:
+                    params: dict = {"sort": sort, "count": count, "unconfirmed": "incl", "taxonCode": code}
+                    if not all_media:
+                        params["mediaType"] = "photo"
+                    if region_code:
+                        params["regionCode"] = region_code
+                    return await _search(session, **params)
+
+            pages = await asyncio.gather(*(one_taxon(m["code"]) for m in named))
+            merged = [item for page in pages for item in page]
+            merged.sort(key=_merge_key(sort), reverse=True)
+            items = merged[:count]
         else:
             if species_query:
-                species_code, species_display = await resolve_species(species_query, session=session)
+                species_code, species_display = await resolve_species(
+                    species_query, session=session, regional_taxa=regional_taxa
+                )
             params: dict = {"sort": sort, "count": count, "unconfirmed": "incl"}
             if user_id:
                 params["userId"] = user_id
@@ -420,7 +608,11 @@ async def fetch_user_details(
                 params["mediaType"] = "photo"
             if species_code:
                 params["taxonCode"] = species_code
+            if region_code:
+                params["regionCode"] = region_code
             items = (await _search(session, **params))[:count]
+        if region_code and species_display:
+            species_display += f" in {region_code}"
         if include_exif and items:
             semaphore = asyncio.Semaphore(4)
 
@@ -440,6 +632,7 @@ async def fetch_user_details(
             species_code=species_code,
             species_display=species_display,
             details=[_item_to_details(i, e) for i, e in zip(items, exifs)],
+            region=region_code,
         )
     except (aiohttp.ClientError, asyncio.TimeoutError) as error:
         raise ChecklistError(f"Couldn't reach Macaulay Library ({error.__class__.__name__}).") from error
@@ -594,7 +787,7 @@ async def _main(argv: list[str]) -> int:
         )
         return 2
     if user_mode:
-        count, sort, group = 10, SORT_BEST, False
+        count, sort, group, region = 10, SORT_BEST, False, ""
         species_words: list[str] = []
         for token in args[1:]:
             if token.isdigit():
@@ -607,6 +800,8 @@ async def _main(argv: list[str]) -> int:
                 sort = SORT_BEST
             elif token.lower() == "group":
                 group = True
+            elif token.lower().startswith("in:"):
+                region = token[3:]
             else:
                 species_words.append(token)
         result = await fetch_user_details(
@@ -614,6 +809,7 @@ async def _main(argv: list[str]) -> int:
             species_query=" ".join(species_words) or None,
             species_group=group,
             all_media=bool(species_words),
+            region=region,
         )
         kind = {
             SORT_RECENT: "most recently uploaded",
