@@ -19,9 +19,11 @@ from ebird_media import (
     SORT_BEST,
     SORT_OBS,
     SORT_RECENT,
+    RareReport,
     extract_flags,
     fetch_asset_details,
     fetch_checklist_photos,
+    fetch_rare_reports,
     fetch_user_details,
     parse_asset_id,
     parse_checklist_id,
@@ -413,6 +415,82 @@ async def recent_command(
         await _send_user_photos(
             interaction, user, count, SORT_RECENT, "{n} most recently uploaded photos"
         )
+
+
+def build_rare_embed(report: RareReport, compact_flag: str | None) -> discord.Embed:
+    """A rare-bird alert: the photo, who/where/when, and how rare it is."""
+    embed = build_embed(
+        report.details.photo, checklist_id=report.checklist_id, show_rating=True
+    )
+    embed.title = f"{report.rarity_emoji} {report.common_name}"
+    embed.add_field(name="Rarity", value=report.rarity_display, inline=False)
+    if compact_flag == COMPACT_FLAG:
+        return embed
+
+    embed.add_field(name="Observed", value=report.obs_dt or "—", inline=True)
+    if report.location:
+        embed.add_field(name="Location", value=report.location[:1024], inline=True)
+    if report.observer:
+        embed.add_field(name="Observer", value=report.observer[:1024], inline=True)
+    embed.add_field(name="Status", value="✅ Reviewed & accepted", inline=True)
+    if report.reports_in_window > 1:
+        embed.add_field(
+            name="Other reports", value=f"{report.reports_in_window} in the window", inline=True
+        )
+    if compact_flag:
+        camera = [(label, value) for label, value, is_cam in select_fields(report.details, compact_flag) if is_cam]
+    else:
+        camera = list(report.details.exif)
+    for label, value in camera:
+        if len(embed.fields) >= 25:  # Discord's per-embed field limit
+            break
+        embed.add_field(name=f"📷 {label}", value=value[:1024], inline=True)
+    return embed
+
+
+@bot.tree.command(
+    name="rare",
+    description="Recent eBird-confirmed rare bird reports with photos for a region",
+)
+@app_commands.describe(
+    region="eBird region — code (US-WA, US-WA-033) or name (washington); -c/-cc/-ccc flags allowed",
+    count="How many reports to post (1–25, default 10)",
+    days="How many days back to search (1–30, default 14)",
+    repeats="Allow several reports of the same species (default: most recent of each)",
+)
+async def rare_command(
+    interaction: discord.Interaction,
+    region: str,
+    count: app_commands.Range[int, 1, 25] = 10,
+    days: app_commands.Range[int, 1, 30] = 14,
+    repeats: bool = False,
+) -> None:
+    await interaction.response.defer()
+    flags, rest = extract_flags(region.split())
+    compact_flag = pick_compact_flag(flags)
+    try:
+        region_code, reports = await fetch_rare_reports(
+            " ".join(rest), count=count, days=days, unique_species=not repeats,
+            include_exif=compact_flag != COMPACT_FLAG,
+        )
+    except ChecklistError as error:
+        await interaction.followup.send(str(error))
+        return
+    if not reports:
+        await interaction.followup.send(
+            f"No eBird-confirmed rarities with public photos in `{region_code}` "
+            f"over the last {days} days."
+        )
+        return
+
+    learn_names([(r.details.photo.photographer, r.details.photo.user_id) for r in reports])
+    plural = "ies" if len(reports) != 1 else "y"
+    await interaction.followup.send(
+        f"**{len(reports)} confirmed rarit{plural} with photos** · `{region_code}` · "
+        f"last {days} days · [region page](<https://ebird.org/region/{region_code}>)"
+    )
+    for report in reports:
+        await interaction.followup.send(embed=build_rare_embed(report, compact_flag))
 
 
 @bot.tree.command(
