@@ -113,6 +113,7 @@ class Photo:
     age_sex: str = ""
     notes: str = ""
     tags: str = ""
+    user_id: str = ""  # eBird USER… ID of the photographer
 
     @property
     def asset_url(self) -> str:
@@ -519,6 +520,7 @@ def _to_photo(item: dict) -> Photo:
         age_sex=_summarize_age_sex(item.get("ageSex") or {}),
         notes="; ".join(bit for bit in (item.get("caption"), item.get("mediaNotes")) if bit),
         tags=tags or "",
+        user_id=item.get("userId") or "",
     )
 
 
