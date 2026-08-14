@@ -1036,8 +1036,8 @@ async def fetch_rare_reports(
 
     Only observations a reviewer has accepted (`obsValid`) are returned. By
     default each must also have a retrievable public photo; with
-    `require_photo=False` every confirmed report is listed and no media is
-    fetched, leaving `RareReport.details` as None.
+    `require_photo=False` every confirmed report is listed, and `details`
+    holds a photo only for those that actually have one.
     """
     owns_session = session is None
     if owns_session:
@@ -1084,6 +1084,8 @@ async def fetch_rare_reports(
         semaphore = asyncio.Semaphore(6)
 
         async def first_photo(obs: dict) -> tuple[dict, dict | None]:
+            if not obs.get("hasRichMedia"):
+                return obs, None
             async with semaphore:
                 page = await _search(
                     session, subId=obs["subId"], taxonCode=obs["speciesCode"],
@@ -1095,7 +1097,9 @@ async def fetch_rare_reports(
         # candidates newest-first and keep the ones that really have one
         selected: list[tuple[dict, dict | None]] = []
         if not require_photo:
-            selected = [(obs, None) for obs in ordered[:count]]
+            # keep every confirmed report, but still resolve a photo where eBird
+            # flags one, so callers can mark which reports have imagery
+            selected = list(await asyncio.gather(*(first_photo(o) for o in ordered[:count])))
         else:
             pool = ordered[:RARE_SCAN_MAX]
             batch = max(count, 8)
