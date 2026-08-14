@@ -290,6 +290,7 @@ async def _send_user_photos(
     header: str,
     species: str = "",
     species_group: bool = False,
+    region: str = "",
 ) -> None:
     """Shared body of /top, /recent, /sp; `header` is formatted with n and sp."""
     flags, rest = extract_flags(user.split())
@@ -307,6 +308,7 @@ async def _send_user_photos(
             species_query=species or None,
             species_group=species_group,
             all_media=bool(species),
+            region=region,
         )
     except ChecklistError as error:
         await interaction.followup.send(str(error))
@@ -333,6 +335,8 @@ async def _send_user_photos(
         catalog += "&mediaType=photo"
     if result.species_code:
         catalog += f"&taxonCode={result.species_code}"
+    if result.region:
+        catalog += f"&regionCode={result.region}"
     bits = [f"**{header.format(n=len(result.details), sp=result.species_display)}**"]
     if result.display_name:
         bits.append(result.display_name)
@@ -350,7 +354,8 @@ async def _send_user_photos(
     species="Species — common or scientific name, e.g. 'black oystercatcher'",
     user="Optional: USER… ID, name, @mention, or their asset link — omit for the global best",
     count="How many to post (1–50, default 10)",
-    group="Match every species with this in its name (e.g. all warblers; needs a user)",
+    group="Match every species with this in its name (e.g. all puffins; global if no user)",
+    region="Limit species matches and media to a region — code (US-WA) or name (washington)",
 )
 async def sp_command(
     interaction: discord.Interaction,
@@ -358,11 +363,12 @@ async def sp_command(
     user: str = "",
     count: app_commands.Range[int, 1, 50] = 10,
     group: bool = False,
+    region: str = "",
 ) -> None:
     await interaction.response.defer()
     await _send_user_photos(
         interaction, user, count, SORT_BEST, "{n} media of {sp}",
-        species=species, species_group=group,
+        species=species, species_group=group, region=region,
     )
 
 
