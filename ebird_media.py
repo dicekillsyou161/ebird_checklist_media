@@ -202,7 +202,7 @@ class RareReport:
     rarity_emoji: str
     rarity_share: float | None  # % of the region's photos, None if unknown
     rarity_note: str            # e.g. "8 prior photos in US-WA"
-    details: AssetDetails
+    details: AssetDetails | None   # None in text mode, where photos aren't fetched
 
     @property
     def checklist_url(self) -> str:
@@ -982,6 +982,19 @@ async def _media_count(
     return data
 
 
+def _rarity_scope(region_code: str) -> str:
+    """Counties are ranked against their state; everything else against itself."""
+    return region_code.rsplit("-", 1)[0] if region_code.count("-") == 2 else region_code
+
+
+async def _warm_rarity_baseline(region_code: str, session: aiohttp.ClientSession) -> None:
+    """Fetch the region's photo totals once, so parallel lookups all hit the cache."""
+    scope = _rarity_scope(region_code)
+    total = (await _media_count(scope, "", session, date.today().year - 1)).get("photo") or 0
+    if total < RARITY_MIN_BASELINE:
+        await _media_count(scope, "", session)
+
+
 async def _rarity(
     region_code: str, species_code: str, session: aiohttp.ClientSession
 ) -> tuple[str, str, float | None, str]:
@@ -990,7 +1003,7 @@ async def _rarity(
     Rarity is judged at state/province scale even for a county query: the
     counts are far more stable, and it matches how birders rank a record.
     """
-    scope = region_code.rsplit("-", 1)[0] if region_code.count("-") == 2 else region_code
+    scope = _rarity_scope(region_code)
     end_year: int | None = date.today().year - 1
     total = (await _media_count(scope, "", session, end_year)).get("photo") or 0
     if total < RARITY_MIN_BASELINE:
@@ -1016,12 +1029,15 @@ async def fetch_rare_reports(
     days: int = 14,
     unique_species: bool = True,
     include_exif: bool = False,
+    require_photo: bool = True,
     session: aiohttp.ClientSession | None = None,
 ) -> tuple[str, list[RareReport]]:
-    """Recent eBird-confirmed rarities in a region that have public photos.
+    """Recent eBird-confirmed rarities in a region, most recent first.
 
-    Ranked most recent first. Only observations a reviewer has accepted
-    (`obsValid`) and for which a photo is actually retrievable are returned.
+    Only observations a reviewer has accepted (`obsValid`) are returned. By
+    default each must also have a retrievable public photo; with
+    `require_photo=False` every confirmed report is listed and no media is
+    fetched, leaving `RareReport.details` as None.
     """
     owns_session = session is None
     if owns_session:
@@ -1047,7 +1063,10 @@ async def fetch_rare_reports(
         per_species = Counter(o.get("speciesCode") for o in observations)
         # "confirmed" = a regional reviewer accepted the record; hasRichMedia
         # is eBird's own flag that something was attached (photo, audio or video)
-        candidates = [o for o in observations if o.get("obsValid") and o.get("hasRichMedia")]
+        candidates = [
+            o for o in observations
+            if o.get("obsValid") and (o.get("hasRichMedia") or not require_photo)
+        ]
         ordered: list[dict] = []
         seen_reports: set[tuple] = set()
         seen_species: set[str] = set()
@@ -1074,29 +1093,39 @@ async def fetch_rare_reports(
 
         # hasRichMedia doesn't guarantee an indexed public photo, so walk the
         # candidates newest-first and keep the ones that really have one
-        selected: list[tuple[dict, dict]] = []
-        pool = ordered[:RARE_SCAN_MAX]
-        batch = max(count, 8)
-        for start in range(0, len(pool), batch):
-            if len(selected) >= count:
-                break
-            for obs, item in await asyncio.gather(*(first_photo(o) for o in pool[start:start + batch])):
-                if item is not None and len(selected) < count:
-                    selected.append((obs, item))
+        selected: list[tuple[dict, dict | None]] = []
+        if not require_photo:
+            selected = [(obs, None) for obs in ordered[:count]]
+        else:
+            pool = ordered[:RARE_SCAN_MAX]
+            batch = max(count, 8)
+            for start in range(0, len(pool), batch):
+                if len(selected) >= count:
+                    break
+                for obs, item in await asyncio.gather(
+                    *(first_photo(o) for o in pool[start:start + batch])
+                ):
+                    if item is not None and len(selected) < count:
+                        selected.append((obs, item))
 
-        if include_exif and selected:
+        if include_exif and require_photo and selected:
             exif_sem = asyncio.Semaphore(4)
 
             async def grab(item: dict) -> tuple[tuple[str, str], ...]:
                 async with exif_sem:
                     return await _fetch_exif(session, item["assetId"])
 
-            exifs = await asyncio.gather(*(grab(item) for _, item in selected))
+            exifs = await asyncio.gather(*(grab(item) for _, item in selected if item))
         else:
             exifs = [()] * len(selected)
-        rarities = await asyncio.gather(
-            *(_rarity(region_code, obs["speciesCode"], session) for obs, _ in selected)
-        )
+        await _warm_rarity_baseline(region_code, session)
+        rarity_sem = asyncio.Semaphore(4)
+
+        async def rarity_for(species_code: str):
+            async with rarity_sem:
+                return await _rarity(region_code, species_code, session)
+
+        rarities = await asyncio.gather(*(rarity_for(obs["speciesCode"]) for obs, _ in selected))
 
         reports = []
         for (obs, item), exif, (label, emoji, share, note) in zip(selected, exifs, rarities):
@@ -1113,7 +1142,7 @@ async def fetch_rare_reports(
                 rarity_emoji=emoji,
                 rarity_share=share,
                 rarity_note=note,
-                details=_item_to_details(item, exif),
+                details=_item_to_details(item, exif) if item else None,
             ))
         return region_code, reports
     except (aiohttp.ClientError, asyncio.TimeoutError) as error:
@@ -1128,22 +1157,26 @@ async def _main(argv: list[str]) -> int:
     verbose = VERBOSE_FLAG in flags
     compact_flag = pick_compact_flag(flags)
     if args and args[0].lower() == "rare":
-        words = [t for t in args[1:] if not t.isdigit()]
-        nums = [int(t) for t in args[1:] if t.isdigit()]
+        rest = args[1:]
+        text_mode = any(t.lower() in ("text", "nophoto") for t in rest)
+        words = [t for t in rest if not t.isdigit() and t.lower() not in ("text", "nophoto")]
+        nums = [int(t) for t in rest if t.isdigit()]
         if not words:
-            print("usage: python ebird_media.py rare <region> [count] [days]", file=sys.stderr)
+            print("usage: python ebird_media.py rare <region> [count] [days] [text]", file=sys.stderr)
             return 2
         region_code, reports = await fetch_rare_reports(
             " ".join(words),
             count=nums[0] if nums else 10,
             days=nums[1] if len(nums) > 1 else 14,
+            require_photo=not text_mode,
         )
-        print(f"{len(reports)} eBird-confirmed rarities with photos in {region_code}")
+        qualifier = "" if text_mode else " with photos"
+        print(f"{len(reports)} eBird-confirmed rarities{qualifier} in {region_code}")
         for report in reports:
             print(f"  {report.obs_dt}  {report.rarity_emoji} {report.common_name:<26} "
                   f"{report.rarity_display}")
-            print(f"      ML{report.details.photo.asset_id} · {report.location} · "
-                  f"{report.observer} · {report.checklist_url}")
+            asset = f"ML{report.details.photo.asset_id} · " if report.details else ""
+            print(f"      {asset}{report.location} · {report.observer} · {report.checklist_url}")
         return 0
     user_mode = bool(args) and bool(_USER_ID_RE.search(args[0]) or _PROFILE_URL_RE.search(args[0]))
     if not args or (not user_mode and len(args) != 1):
