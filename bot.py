@@ -202,32 +202,75 @@ def build_asset_embed(details: AssetDetails, compact_flag: str | None) -> discor
 
 
 async def _send_user_photos(
-    interaction: discord.Interaction, user: str, count: int, sort: str, header: str
+    interaction: discord.Interaction,
+    user: str,
+    count: int,
+    sort: str,
+    header: str,
+    species: str = "",
+    species_group: bool = False,
 ) -> None:
-    """Shared body of /top and /recent; `header` is formatted with n=photo count."""
+    """Shared body of /top, /recent, /sp; `header` is formatted with n and sp."""
     flags, rest = extract_flags(user.split())
+    if species:
+        species_flags, species_rest = extract_flags(species.split())
+        flags |= species_flags
+        species = " ".join(species_rest)
     compact_flag = pick_compact_flag(flags)
     try:
-        name, user_id, all_details = await fetch_user_details(
+        result = await fetch_user_details(
             " ".join(rest), count=count, sort=sort,
             include_exif=compact_flag != COMPACT_FLAG,
+            species_query=species or None,
+            species_group=species_group,
+            all_media=bool(species),
         )
     except ChecklistError as error:
         await interaction.followup.send(str(error))
         return
-    if not all_details:
+    if not result.details:
+        target = f" of {result.species_display}" if result.species_display else ""
         await interaction.followup.send(
-            f"No public photos found for `{user_id}` — check the ID, "
+            f"No public media{target} found for `{result.user_id}` — check the ID, "
             "or pass one of their Macaulay Library asset links."
         )
         return
 
-    catalog = f"https://media.ebird.org/catalog?userId={user_id}&mediaType=photo&sort={sort}"
+    catalog = f"https://media.ebird.org/catalog?userId={result.user_id}&sort={sort}"
+    if not species:
+        catalog += "&mediaType=photo"
+    if result.species_code:
+        catalog += f"&taxonCode={result.species_code}"
     await interaction.followup.send(
-        f"**{header.format(n=len(all_details))}** · {name} · [full gallery](<{catalog}>)"
+        f"**{header.format(n=len(result.details), sp=result.species_display)}** · "
+        f"{result.display_name} · [full gallery](<{catalog}>)"
     )
-    for details in all_details:
+    for details in result.details:
         await interaction.followup.send(embed=build_asset_embed(details, compact_flag))
+
+
+@bot.tree.command(
+    name="sp",
+    description="Post a user's media of one species (common or scientific name)",
+)
+@app_commands.describe(
+    species="Species — common or scientific name, e.g. 'black oystercatcher'",
+    user="Their USER… ID or any ML asset link by them — flags -c, -cc, -ccc as in /checkmedia",
+    count="How many to post (1–50, default 10)",
+    group="Match every species with this in its name (e.g. all warblers)",
+)
+async def sp_command(
+    interaction: discord.Interaction,
+    species: str,
+    user: str,
+    count: app_commands.Range[int, 1, 50] = 10,
+    group: bool = False,
+) -> None:
+    await interaction.response.defer()
+    await _send_user_photos(
+        interaction, user, count, SORT_BEST, "{n} media of {sp}",
+        species=species, species_group=group,
+    )
 
 
 @bot.tree.command(
