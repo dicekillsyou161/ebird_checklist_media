@@ -23,6 +23,9 @@ import aiohttp
 
 API_URL = "https://media.ebird.org/api/v2/search"
 ASSET_PAGE = "https://macaulaylibrary.org/asset/{asset_id}"
+TAXON_FIND_URL = "https://api.ebird.org/v2/ref/taxon/find"
+# eBird's own key for its public web autocomplete widgets (not a personal API key)
+EBIRD_WEB_KEY = "jfekjedvescr"
 SORT_BEST = "rating_rank_desc"     # Macaulay "Best quality" ranking
 SORT_RECENT = "upload_date_desc"   # most recently uploaded
 SORT_OBS = "obs_date_desc"         # most recent observation date/time
@@ -158,6 +161,15 @@ class AssetDetails:
     media_type: str
     checklist_id: str
     exif: tuple[tuple[str, str], ...]  # (label, value) camera metadata
+
+
+@dataclass(frozen=True)
+class UserMedia:
+    display_name: str
+    user_id: str
+    species_code: str     # "" when not filtered by species
+    species_display: str  # e.g. "Black Oystercatcher - Haematopus bachmani"
+    details: list[AssetDetails]
 
 
 def parse_asset_id(text: str) -> int:
@@ -297,32 +309,106 @@ async def resolve_user(text: str, *, session: aiohttp.ClientSession) -> str:
     )
 
 
+async def resolve_species(query: str, *, session: aiohttp.ClientSession) -> tuple[str, str]:
+    """Match a common or scientific name to (taxonCode, display name).
+
+    An exact name match wins outright; otherwise a lone hit is used as-is,
+    and multiple hits raise a did-you-mean error rather than silently
+    searching the wrong species.
+    """
+    params = {"locale": "en", "cat": "species", "limit": "25", "key": EBIRD_WEB_KEY, "q": query}
+    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
+    async with session.get(
+        TAXON_FIND_URL, params=params, headers=headers,
+        timeout=aiohttp.ClientTimeout(total=25),
+    ) as resp:
+        if resp.status != 200:
+            raise ChecklistError(f"Species lookup returned HTTP {resp.status} — try again in a minute.")
+        matches = await resp.json(content_type=None)
+    if not isinstance(matches, list) or not matches:
+        raise ChecklistError(
+            f"No species matched “{query}” — try the exact common or scientific name."
+        )
+    lowered = query.strip().lower()
+    for match in matches:
+        common, _, scientific = match["name"].partition(" - ")
+        if lowered in (common.lower(), scientific.lower()):
+            return match["code"], match["name"]
+    if len(matches) == 1:
+        return matches[0]["code"], matches[0]["name"]
+    more = "+" if len(matches) == 25 else ""
+    preview = "; ".join(m["name"] for m in matches[:5])
+    raise ChecklistError(
+        f"“{query}” matches {len(matches)}{more} species — use a more exact name, "
+        "or set `group:True` to search everything matching it in their library. "
+        f"Closest matches: {preview} …"
+    )
+
+
+async def _paged_user_search(
+    session: aiohttp.ClientSession, user_id: str, *, sort: str, all_media: bool
+) -> list[dict]:
+    """Page through a user's media in server sort order, up to MAX_PHOTOS items."""
+    items: list[dict] = []
+    cursor: str | None = None
+    while len(items) < MAX_PHOTOS:
+        params: dict = {"userId": user_id, "sort": sort, "count": PAGE_SIZE, "unconfirmed": "incl"}
+        if not all_media:
+            params["mediaType"] = "photo"
+        if cursor:
+            params["initialCursorMark"] = cursor
+        page = await _search(session, **params)
+        items.extend(page)
+        if len(page) < PAGE_SIZE:
+            break
+        cursor = page[-1].get("cursorMark")
+        if not cursor:
+            break
+    return items[:MAX_PHOTOS]
+
+
 async def fetch_user_details(
     user_ref: str,
     *,
     count: int = 10,
     include_exif: bool = True,
     sort: str = SORT_BEST,
+    species_query: str | None = None,
+    species_group: bool = False,
+    all_media: bool = False,
     session: aiohttp.ClientSession | None = None,
-) -> tuple[str, str, list[AssetDetails]]:
-    """A user's public photos, ranked by `sort` (best quality or most recent).
+) -> UserMedia:
+    """A user's public media, ranked by `sort`, optionally one species only.
 
-    Returns (display_name, user_id, details). EXIF fetches are skipped when
-    the caller won't show camera fields.
+    Photos only unless `all_media`. With `species_group`, `species_query` is
+    a name substring matched against every species in the user's library
+    (their most recent/best MAX_PHOTOS items) instead of one resolved taxon.
+    EXIF fetches are skipped when the caller won't show camera fields.
     """
     owns_session = session is None
     if owns_session:
         session = aiohttp.ClientSession()
     try:
         user_id = await resolve_user(user_ref, session=session)
-        items = (await _search(
-            session,
-            userId=user_id,
-            mediaType="photo",
-            sort=sort,
-            count=count,
-            unconfirmed="incl",
-        ))[:count]
+        species_code = species_display = ""
+        if species_query and species_group:
+            needle = species_query.strip().lower()
+            species_display = f"“{species_query.strip()}”"
+            everything = await _paged_user_search(session, user_id, sort=sort, all_media=all_media)
+            items = [
+                item for item in everything
+                if needle in ((item.get("taxonomy") or {}).get("comName") or "").lower()
+                or needle in ((item.get("taxonomy") or {}).get("sciName") or "").lower()
+            ][:count]
+        else:
+            if species_query:
+                species_code, species_display = await resolve_species(species_query, session=session)
+            params: dict = {"userId": user_id, "sort": sort, "count": count, "unconfirmed": "incl"}
+            if not all_media:
+                params["mediaType"] = "photo"
+            if species_code:
+                params["taxonCode"] = species_code
+            items = (await _search(session, **params))[:count]
         if include_exif and items:
             semaphore = asyncio.Semaphore(4)
 
@@ -334,7 +420,13 @@ async def fetch_user_details(
         else:
             exifs = [()] * len(items)
         name = (items[0].get("userDisplayName") if items else "") or user_id
-        return name, user_id, [_item_to_details(i, e) for i, e in zip(items, exifs)]
+        return UserMedia(
+            display_name=name,
+            user_id=user_id,
+            species_code=species_code,
+            species_display=species_display,
+            details=[_item_to_details(i, e) for i, e in zip(items, exifs)],
+        )
     except (aiohttp.ClientError, asyncio.TimeoutError) as error:
         raise ChecklistError(f"Couldn't reach Macaulay Library ({error.__class__.__name__}).") from error
     finally:
@@ -479,16 +571,16 @@ async def _main(argv: list[str]) -> int:
     verbose = VERBOSE_FLAG in flags
     compact_flag = pick_compact_flag(flags)
     user_mode = bool(args) and bool(_USER_ID_RE.search(args[0]) or _PROFILE_URL_RE.search(args[0]))
-    extras_ok = user_mode and all(t.isdigit() or t.lower() in ("top", "recent", "obs") for t in args[1:])
-    if not (len(args) == 1 or (extras_ok and len(args) <= 3)):
+    if not args or (not user_mode and len(args) != 1):
         print(
             "usage: python ebird_media.py [-vvv | -c | -cc | -ccc] "
-            "<checklist URL/ID | ML asset URL/number | USER… ID [count] [top|recent|obs]>",
+            "<checklist URL/ID | ML asset URL/number | USER… ID [count] [top|recent|obs] [species]>",
             file=sys.stderr,
         )
         return 2
     if user_mode:
-        count, sort = 10, SORT_BEST
+        count, sort, group = 10, SORT_BEST, False
+        species_words: list[str] = []
         for token in args[1:]:
             if token.isdigit():
                 count = int(token)
@@ -496,18 +588,29 @@ async def _main(argv: list[str]) -> int:
                 sort = SORT_RECENT
             elif token.lower() == "obs":
                 sort = SORT_OBS
-        name, user_id, all_details = await fetch_user_details(
-            args[0], count=count, sort=sort, include_exif=False
+            elif token.lower() == "top":
+                sort = SORT_BEST
+            elif token.lower() == "group":
+                group = True
+            else:
+                species_words.append(token)
+        result = await fetch_user_details(
+            args[0], count=count, sort=sort, include_exif=False,
+            species_query=" ".join(species_words) or None,
+            species_group=group,
+            all_media=bool(species_words),
         )
         kind = {
             SORT_RECENT: "most recently uploaded",
             SORT_OBS: "most recent by observation date",
         }.get(sort, "top rated")
-        print(f"{len(all_details)} {kind} photos by {name} ({user_id})")
-        for details in all_details:
+        of_species = f" of {result.species_display}" if result.species_display else ""
+        print(f"{len(result.details)} {kind} media{of_species} by {result.display_name} ({result.user_id})")
+        for details in result.details:
             photo = details.photo
             flag = "  [UNCONFIRMED]" if photo.unconfirmed else ""
-            print(f"  ML{photo.asset_id}  {photo.common_name:<28} {photo.rating_display:<12} {photo.asset_url}{flag}")
+            kind_note = f"  ({details.media_type})" if details.media_type != "photo" else ""
+            print(f"  ML{photo.asset_id}  {photo.common_name:<28} {photo.rating_display:<12} {photo.asset_url}{kind_note}{flag}")
         return 0
     if _ASSET_URL_RE.search(args[0]) or _ASSET_ML_RE.search(args[0]):
         details = await fetch_asset_details(parse_asset_id(args[0]))
@@ -545,4 +648,8 @@ async def _main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(asyncio.run(_main(sys.argv[1:])))
+    try:
+        raise SystemExit(asyncio.run(_main(sys.argv[1:])))
+    except ChecklistError as error:
+        print(error, file=sys.stderr)
+        raise SystemExit(1)
