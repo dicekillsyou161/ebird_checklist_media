@@ -390,7 +390,16 @@ async def fetch_user_details(
     if owns_session:
         session = aiohttp.ClientSession()
     try:
-        user_id = await resolve_user(user_ref, session=session)
+        user_id = ""
+        if user_ref:
+            user_id = await resolve_user(user_ref, session=session)
+        elif species_group:
+            raise ChecklistError(
+                "`group:True` scans one person's library — add a user, or use an "
+                "exact species name for a global search."
+            )
+        elif not species_query:
+            raise ChecklistError("Give me a user, a species, or both.")
         species_code = species_display = ""
         if species_query and species_group:
             needle = species_query.strip().lower()
@@ -404,7 +413,9 @@ async def fetch_user_details(
         else:
             if species_query:
                 species_code, species_display = await resolve_species(species_query, session=session)
-            params: dict = {"userId": user_id, "sort": sort, "count": count, "unconfirmed": "incl"}
+            params: dict = {"sort": sort, "count": count, "unconfirmed": "incl"}
+            if user_id:
+                params["userId"] = user_id
             if not all_media:
                 params["mediaType"] = "photo"
             if species_code:
@@ -420,7 +431,9 @@ async def fetch_user_details(
             exifs = await asyncio.gather(*(grab(item) for item in items))
         else:
             exifs = [()] * len(items)
-        name = (items[0].get("userDisplayName") if items else "") or user_id
+        name = ""
+        if user_id:
+            name = (items[0].get("userDisplayName") if items else "") or user_id
         return UserMedia(
             display_name=name,
             user_id=user_id,
