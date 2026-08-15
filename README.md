@@ -144,6 +144,19 @@ Two friendlier forms also work everywhere a user is accepted:
   `/iam <their USER… ID or asset link>` (private/ephemeral reply), their
   @mention works as a user reference.
 
+Linking with `/iam` also lets you drop the `user` option entirely on `/top`
+and `/recent` to get your own photos:
+
+```
+/iam ML662698120     (once)
+/top                 (your own top-rated photos)
+/recent count:5      (your own latest uploads)
+```
+
+Without a link, those commands reply with a note telling you to name someone
+or run `/iam`. `/sp` is deliberately different: leaving `user` blank there
+means a global search across all of Macaulay Library, not your own photos.
+
 ## Setup
 
 **1. Create the Discord application**
