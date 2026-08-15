@@ -218,6 +218,13 @@ bot notices, prints exactly what to change, and automatically falls back to
 guild install so servers and DMs keep working. Set `USER_INSTALL=false` in
 `.env` to skip user install entirely.
 
+The portal's **General Information** page also has *Terms of Service URL*
+and *Privacy Policy URL* fields; point them at
+[TERMS_OF_SERVICE.md](TERMS_OF_SERVICE.md) and
+[PRIVACY_POLICY.md](PRIVACY_POLICY.md) (for a GitHub repo, the rendered
+files' URLs work). Fill in the bracketed placeholders near the bottom of
+each file first (contact in both, governing law in the terms).
+
 One limit worth knowing: in a server where only *you* have installed the app
 (the bot itself isn't a member), Discord treats the app as a guest. Command
 replies are visible only to you there, which suits lookups like `/checkmedia`
@@ -280,7 +287,7 @@ verified or not:
 /alert region:king county wa
 /alert region:US-WA rarity:🟠 Very rare or rarer
 /alert region:island county wa confirmations:True
-/alerts        (list your subscriptions)
+/alerts        (list your subscriptions, each with its 3 most recent reports)
 /unalert region:US-WA      (or /unalert with no region to cancel all)
 ```
 
@@ -299,6 +306,11 @@ verified or not:
 - **No backlog on subscribe**: everything already in the window is marked as
   seen, so you only hear about what happens next. Re-subscribing to a region
   you already watch updates the settings and keeps that history.
+- **`/alerts` shows recent activity**: under each subscription it lists the 3
+  most recent reports the bot has on record for that region (species, rarity
+  tier, review status, observation time, checklist link). This includes
+  reports below your rarity floor and the ones marked seen when you
+  subscribed, so a fresh subscription already shows what's current.
 - **Delivery**: alerts are DMs, so the bot must be able to message you; it
   sends a confirmation DM when you subscribe and warns you in the reply if
   that fails. After 3 consecutive failures a subscription pauses and `/alerts`
