@@ -18,6 +18,7 @@ import db
 from alerts import (
     CONFIRMATION,
     RARITY_LEVELS,
+    STATUS_MARKS,
     AlertStore,
     Subscription,
 )
@@ -1036,18 +1037,23 @@ async def poll_region(
         sent = 0
         for report in reports:
             key = f"{report.checklist_id}:{report.species_code}"
+            rarity = f"{report.rarity_emoji} {report.rarity_label}".strip()
             kind = subscription.pending_kind(key, report.status)
             if kind is None:
                 continue
             if not subscription.wants_rarity(report.rarity_label):
                 # record it anyway, or every poll would rebuild the same report
-                subscription.mark_seen(key, report.obs_dt, report.status)
+                subscription.mark_seen(
+                    key, report.obs_dt, report.status, report.common_name, rarity
+                )
                 changed = True
                 continue
             if sent >= ALERT_DM_MAX:
                 break
             if await deliver_alert(subscription, build_alert_embed(report, subscription, kind)):
-                subscription.mark_seen(key, report.obs_dt, report.status)
+                subscription.mark_seen(
+                    key, report.obs_dt, report.status, report.common_name, rarity
+                )
                 subscription.alerts_sent += 1
                 subscription.last_alert = datetime.now(timezone.utc).isoformat(timespec="seconds")
                 subscription.failures = 0
@@ -1144,7 +1150,12 @@ async def alert_command(
         created=datetime.now(timezone.utc).isoformat(timespec="seconds"),
     )
     for obs in backlog:
-        subscription.mark_seen(notable_key(obs), obs.get("obsDt") or "", notable_status(obs))
+        subscription.mark_seen(
+            notable_key(obs),
+            obs.get("obsDt") or "",
+            notable_status(obs),
+            species=obs.get("comName") or "",
+        )
     store.add(subscription)
     store.save()
 
@@ -1173,6 +1184,23 @@ async def alert_command(
     await interaction.followup.send(summary, ephemeral=True)
 
 
+def seen_line(key: str, value: list[str]) -> str:
+    """One remembered report as a digest line for /alerts."""
+    obs_dt, status, species, rarity = value
+    checklist_id, _, species_code = key.partition(":")
+    name = species or species_code or checklist_id
+    bits = [
+        rarity,
+        f"**{name}** {STATUS_MARKS.get(status, '')}".strip(),
+        obs_dt,
+        f"[{checklist_id}](https://ebird.org/checklist/{checklist_id})",
+    ]
+    return "> " + " · ".join(bit for bit in bits if bit)
+
+
+ALERTS_LIST_BUDGET = 4000  # embed descriptions cap at 4096
+
+
 @bot.tree.command(name="alerts", description="Show your rare bird alert subscriptions")
 async def alerts_command(interaction: discord.Interaction) -> None:
     await interaction.response.defer(ephemeral=True)
@@ -1183,7 +1211,7 @@ async def alerts_command(interaction: discord.Interaction) -> None:
             ephemeral=True,
         )
         return
-    lines = []
+    blocks = []
     for subscription in sorted(mine, key=lambda s: s.region):
         bits = [subscription.rarity_label, f"{subscription.alerts_sent} sent"]
         if subscription.confirmations:
@@ -1192,12 +1220,23 @@ async def alerts_command(interaction: discord.Interaction) -> None:
             bits.append("⚠️ paused (DMs failed; re-run `/alert` to resume)")
         if subscription.last_alert:
             bits.append(f"last {subscription.last_alert[:16].replace('T', ' ')}")
-        lines.append(
-            f"**{subscription.display_region}** (`{subscription.region}`)\n{' · '.join(bits)}"
-        )
+        lines = [
+            f"**{subscription.display_region}** (`{subscription.region}`)",
+            " · ".join(bits),
+        ]
+        lines += [seen_line(key, value) for key, value in subscription.recent_seen(3)]
+        blocks.append("\n".join(lines))
+    kept: list[str] = []
+    used = 0
+    for block in blocks:
+        if used + len(block) + 2 > ALERTS_LIST_BUDGET:
+            kept.append(f"…and {len(blocks) - len(kept)} more region(s)")
+            break
+        kept.append(block)
+        used += len(block) + 2
     embed = discord.Embed(
         title="🔔 Your rare bird alerts",
-        description="\n\n".join(lines),
+        description="\n\n".join(kept),
         color=EMBED_COLOR,
     )
     embed.set_footer(text=f"Checked every {ALERT_INTERVAL_SECONDS // 60} min · /unalert to stop one")
