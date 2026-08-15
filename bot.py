@@ -188,6 +188,18 @@ def learn_names(pairs) -> None:
         _save_registry()
 
 
+def linked_user(interaction: discord.Interaction) -> str:
+    """The eBird ID this Discord account linked with /iam, or "" if none."""
+    return _registry["discord"].get(str(interaction.user.id), "")
+
+
+NO_USER_LINKED = (
+    "Whose photos? Either name someone (their `USER…` ID, an @mention, or one of "
+    "their Macaulay Library asset links), or run `/iam` once with your own ID or "
+    "asset link and then you can leave `user` blank."
+)
+
+
 def resolve_alias(text: str) -> str | None:
     """Turn a Discord @mention or a learned display name into a USER… ID.
 
@@ -675,20 +687,24 @@ async def sp_command(
     description="Post an eBird user's top highest-rated photos",
 )
 @app_commands.describe(
-    user="Their USER… ID, name, @mention, or any ML asset link by them",
+    user="Their USER… ID, name, @mention, or ML asset link; omit for your own (see /iam)",
     count="How many photos to post (1–50, default 10)",
     detail=DETAIL_HELP,
 )
 @app_commands.choices(detail=DETAIL_CHOICES)
 async def top_command(
     interaction: discord.Interaction,
-    user: str,
+    user: str = "",
     count: app_commands.Range[int, 1, 50] = 10,
     detail: app_commands.Choice[str] | None = None,
 ) -> None:
     delivery = await defer_privately(interaction)
+    whose = user.strip() or linked_user(interaction)
+    if not whose:
+        await delivery.notice(NO_USER_LINKED)
+        return
     await _send_user_photos(
-        interaction, user, count, SORT_BEST, "Top {n} rated photos",
+        interaction, whose, count, SORT_BEST, "Top {n} rated photos",
         compact_flag=detail_flag(detail), delivery=delivery,
     )
 
@@ -698,7 +714,7 @@ async def top_command(
     description="Post an eBird user's most recently uploaded photos",
 )
 @app_commands.describe(
-    user="Their USER… ID, name, @mention, or any ML asset link by them",
+    user="Their USER… ID, name, @mention, or ML asset link; omit for your own (see /iam)",
     count="How many photos to post (1–50, default 10)",
     obs="Sort by observation date/time instead of upload date",
     detail=DETAIL_HELP,
@@ -706,21 +722,25 @@ async def top_command(
 @app_commands.choices(detail=DETAIL_CHOICES)
 async def recent_command(
     interaction: discord.Interaction,
-    user: str,
+    user: str = "",
     count: app_commands.Range[int, 1, 50] = 10,
     obs: bool = False,
     detail: app_commands.Choice[str] | None = None,
 ) -> None:
     delivery = await defer_privately(interaction)
+    whose = user.strip() or linked_user(interaction)
+    if not whose:
+        await delivery.notice(NO_USER_LINKED)
+        return
     flag = detail_flag(detail)
     if obs:
         await _send_user_photos(
-            interaction, user, count, SORT_OBS, "{n} most recent photos by observation date",
+            interaction, whose, count, SORT_OBS, "{n} most recent photos by observation date",
             compact_flag=flag, delivery=delivery,
         )
     else:
         await _send_user_photos(
-            interaction, user, count, SORT_RECENT, "{n} most recently uploaded photos",
+            interaction, whose, count, SORT_RECENT, "{n} most recently uploaded photos",
             compact_flag=flag, delivery=delivery,
         )
 
@@ -863,8 +883,9 @@ async def iam_command(interaction: discord.Interaction, user: str) -> None:
     _save_registry()
     learn_names([(result.display_name, result.user_id)])
     await interaction.followup.send(
-        f"Linked! You are **{result.display_name}** (`{result.user_id}`) — your @mention "
-        "and display name now work in /top, /recent, and /sp.",
+        f"Linked! You are **{result.display_name}** (`{result.user_id}`). You can now "
+        "run `/top` and `/recent` without naming a user to get your own photos, and "
+        "your @mention and display name work anywhere a user is asked for.",
         ephemeral=True,
     )
 
