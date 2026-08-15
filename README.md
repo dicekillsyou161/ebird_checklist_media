@@ -1,4 +1,4 @@
-# eBird Checklist Photos: Discord Bot
+# eBird Checklist Photos Discord Bot
 
 One slash command: give it an eBird checklist link or ID, and it posts every
 public photo from that checklist as embeds; species name, the image itself,
@@ -144,10 +144,45 @@ cp .env.example .env    # paste your DISCORD_TOKEN; optionally set GUILD_ID
 ```
 
 Set `GUILD_ID` in `.env` (right-click the server → Copy Server ID, with
-Developer Mode on) to make the command appear instantly in that server;
-comma-separate several IDs to register in multiple servers. Without it, the
-command registers globally in every server the bot has joined, which can take
-up to an hour on first run.
+Developer Mode on) to make the commands appear instantly in that server;
+comma-separate several IDs to register in multiple servers.
+
+The bot always registers its commands globally as well, which is what makes
+them work **in a DM with the bot**, not just in a server. Every command is
+available either way and behaves identically; none of them read server state.
+Global registration can take up to an hour to appear the first time, so a
+fresh bot works in your `GUILD_ID` server immediately but in DMs only once
+Discord has propagated it. Inside a `GUILD_ID` server the instant guild copy
+takes precedence over the global one, so you should not see duplicates; if
+you ever do, clear `GUILD_ID` and rely on the global registration alone.
+
+DM usage is a good fit for `/alert`, `/alerts`, and `/unalert`, since those
+reply privately and deliver to your DMs anyway.
+
+### Installing to your account (user install)
+
+The bot registers as **user-installable**, so the commands can travel with
+your Discord account instead of only living in servers the bot has joined:
+DMs, group DMs, and any server you're in. This needs one setting flipped in
+the Developer Portal, which the code cannot do for you:
+
+1. <https://discord.com/developers/applications> → your app → **Installation**
+2. Under **Installation Contexts**, tick **User Install** (keep Guild Install on)
+3. Under **Default Install Settings** → *User Install*, add the
+   `applications.commands` scope
+4. Restart the bot, then use the **Install Link** from that page (or the
+   app's profile → *Add App* → *Try it yourself*) to add it to your account
+
+If User Install isn't enabled in the portal, Discord rejects the sync; the
+bot notices, prints exactly what to change, and automatically falls back to
+guild install so servers and DMs keep working. Set `USER_INSTALL=false` in
+`.env` to skip user install entirely.
+
+One limit worth knowing: in a server where only *you* have installed the app
+(the bot itself isn't a member), Discord treats the app as a guest. Command
+replies are visible only to you there, which suits lookups like `/checkmedia`
+but means `/checklist` won't post a photo gallery the whole channel can see.
+Invite the bot to that server if you want shared output.
 
 ## Test the fetcher without Discord
 
@@ -165,11 +200,18 @@ public photos, newest first:
 
 ```
 /rare region:US-WA
-/rare region:king county count:5 days:7
+/rare region:king county wa count:5 days:7
 /rare region:-cc US-WA          (compact flags work here too)
+/rare region:US-WA text:True    (one summary embed, photos not required)
 ```
 
-- **Region**: an eBird code (`US`, `US-WA`, `US-WA-033`) or a name.
+- **Region**: an eBird code (`US`, `US-WA`, `US-WA-033`), a state or country
+  name, a bare state abbreviation (`WA`), or a county with its state in any
+  of these forms: `king county wa`, `king wa`, `King County, WA`,
+  `king county washington`. Two-letter input prefers the US state when it
+  isn't also a country code, so `WA` means Washington; use `AU-WA` for
+  Western Australia. An ambiguous name (`king` on its own) comes back with
+  candidates rather than a guess.
 - **Confirmed**: only observations a regional reviewer has accepted
   (`obsValid`). Unreviewed reports of the same bird are skipped, so the list
   lags a live rare-bird alert by however long review takes.
@@ -179,6 +221,50 @@ public photos, newest first:
 - By default it shows the most recent report **per species**; set
   `repeats:True` to allow several reports of the same bird.
 - `days` searches 1–30 days back (eBird's own limit).
+- `text:True` drops the photo requirement and posts everything as a **single**
+  embed: one line per report with rarity, date, place, observer, and a
+  checklist link, but no images. It covers more ground, since photo-less
+  reports are included and recent finds show up sooner. A 📷 marks reports
+  that do have a photo (verified, not just eBird's `hasRichMedia` flag, which
+  also covers audio and unindexed media); open the checklist link to see it.
+  Long lists are trimmed with an "…and N more" line.
+
+### Alert subscriptions (DMs)
+
+`/alert` watches a region and DMs you when a new rare bird is reported there,
+verified or not:
+
+```
+/alert region:king county wa
+/alert region:US-WA rarity:🟠 Very rare or rarer
+/alert region:island county wa confirmations:True
+/alerts        (list your subscriptions)
+/unalert region:US-WA      (or /unalert with no region to cancel all)
+```
+
+- **Cadence**: every watched region is polled every 5 minutes
+  (`ALERT_INTERVAL_SECONDS`). Each poll reads eBird's notable feed for the
+  last 3 days (`ALERT_WINDOW_DAYS`); that window is deliberately wider than
+  the interval because the feed is ordered by *observation* date and
+  checklists are often submitted hours or days late. A report is identified
+  by checklist + species, so a wide window never re-sends anything.
+- **Verified and unverified both alert.** Records eBird reviewers have
+  *rejected* never do. Each DM states where review stands.
+- **`confirmations:True`** adds a second DM if a report you were alerted to
+  while it was pending is later accepted, titled "✅ Confirmed: …".
+- **`rarity`** sets a floor using the same tiers as `/rare`, so you can watch
+  a whole state for megas only and your county for anything.
+- **No backlog on subscribe**: everything already in the window is marked as
+  seen, so you only hear about what happens next. Re-subscribing to a region
+  you already watch updates the settings and keeps that history.
+- **Delivery**: alerts are DMs, so the bot must be able to message you; it
+  sends a confirmation DM when you subscribe and warns you in the reply if
+  that fails. After 3 consecutive failures a subscription pauses and `/alerts`
+  shows it as paused; re-run `/alert` to resume. At most 10 DMs per region per
+  poll, with the remainder carried to the next one.
+- Subscriptions live in `subscriptions.json` beside `bot.py` (gitignored),
+  written atomically and reloaded on restart, so a restart never re-sends an
+  alert or forgets a subscriber.
 
 ### How "level of rarity" is estimated
 
@@ -196,7 +282,9 @@ otherwise look common. The tiers:
 | ≥ 0.40% | ⚪ Locally notable |
 
 The embed always shows the raw basis (e.g. "8 prior photos in US-WA"), so
-you can judge for yourself. Two caveats: it measures *photographic*
+you can judge for yourself. County queries are scored at **state** scale, as
+a single county's counts are too small to rank reliably; the embed cites the
+state it used. Two caveats: it measures *photographic*
 documentation, not sightings, and most eBird-flagged records are ordinary
 species out of range or season; those land in the bottom tiers, which is
 the honest answer. Regions with fewer than 500 prior photos fall back to
@@ -209,6 +297,9 @@ for a deployment at `/opt/ebird-discord-bot` running as the `ebird` user;
 edit the `WorkingDirectory`, `ExecStart`, and `User` lines to match your
 setup. `.env` is read from `WorkingDirectory`, so it must sit in the checkout
 alongside `bot.py`, readable by the service user (and ideally `chmod 600`).
+The service user also needs **write** access to that directory: the bot saves
+`subscriptions.json` (alert subscriptions) and `aliases.json` there, so
+`chown -R ebird: /opt/ebird-discord-bot` after deploying.
 
 ```sh
 sudo useradd --system --shell /usr/sbin/nologin ebird   # once, if it doesn't exist
