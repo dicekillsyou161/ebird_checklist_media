@@ -57,21 +57,29 @@ EMBED_COLOR = discord.Color.from_str("#4a7628")  # eBird green
 # One `detail` option on every command, in place of the old -c/-cc/-ccc/-vvv
 # text flags. Values are the internal compact-flag constants; "full" means none.
 DETAIL_FULL = "full"
+DETAIL_DEFAULT = COMPACT_BRIEF_FLAG  # what you get when `detail` is left unset
 DETAIL_CHOICES = [
-    app_commands.Choice(name="Full: every detail, plus camera EXIF", value=DETAIL_FULL),
+    app_commands.Choice(
+        name="Brief (default): focal length, when and where", value=COMPACT_BRIEF_FLAG
+    ),
     app_commands.Choice(
         name="Camera: focal length, exposure, aperture, ISO, when and where",
         value=COMPACT_CAMERA_FLAG,
     ),
-    app_commands.Choice(name="Brief: focal length, when and where", value=COMPACT_BRIEF_FLAG),
+    app_commands.Choice(name="Full: every detail, plus camera EXIF", value=DETAIL_FULL),
     app_commands.Choice(name="Minimal: species, links and rating only", value=COMPACT_FLAG),
 ]
-DETAIL_HELP = "How much metadata to show (default: full)"
+DETAIL_HELP = "How much metadata to show (default: brief)"
 
 
 def detail_flag(choice: app_commands.Choice[str] | None) -> str | None:
-    """The internal compact flag behind a `detail` choice; None means full detail."""
-    if choice is None or choice.value == DETAIL_FULL:
+    """The internal compact flag behind a `detail` choice.
+
+    None means full detail; leaving the option unset gives the brief level.
+    """
+    if choice is None:
+        return DETAIL_DEFAULT
+    if choice.value == DETAIL_FULL:
         return None
     return choice.value
 
@@ -90,9 +98,17 @@ def _env_flag(name: str, default: bool) -> bool:
 # back to guild-install automatically.
 USER_INSTALL = _env_flag("USER_INSTALL", True)
 
+# The context/install API arrived in discord.py 2.4. On anything older the bot
+# still runs; it just registers commands the old way (servers and DMs).
+SCOPE_API = hasattr(app_commands, "AppCommandContext") and hasattr(
+    app_commands, "AppInstallationType"
+)
+
 
 def command_scopes(user_install: bool):
     """(where commands may run, how the app may be installed) for a global sync."""
+    if not SCOPE_API:
+        return None, None
     return (
         app_commands.AppCommandContext(
             guild=True, dm_channel=True, private_channel=user_install
@@ -214,16 +230,32 @@ class ChecklistBot(discord.Client):
         self.alert_task: asyncio.Task | None = None
 
     def _scope(self, contexts, installs) -> None:
+        if not SCOPE_API:
+            return  # older discord.py: leave registration at its defaults
         for command in self.tree.get_commands():
             command.allowed_contexts = contexts
             command.allowed_installs = installs
 
     async def setup_hook(self) -> None:
         self.alert_task = self.loop.create_task(alert_loop(), name="rare-bird-alerts")
+        print(f"discord.py {discord.__version__}; user-install API: {SCOPE_API}")
+        try:
+            await self._register_commands()
+        except Exception as error:  # noqa: BLE001 - never crash-loop over registration
+            print(
+                f"Command registration failed ({error!r}). The bot is still running, "
+                "but its commands may be missing or out of date."
+            )
+
+    async def _register_commands(self) -> None:
         raw = os.getenv("GUILD_ID", "")
         tokens = [token for token in re.split(r"[,\s]+", raw) if token]
         if not all(token.isdigit() for token in tokens):
-            raise SystemExit(f"GUILD_ID must be numeric server IDs (comma-separated), got: {raw!r}")
+            print(
+                f"Ignoring GUILD_ID={raw!r}: it must be numeric server IDs, "
+                "comma-separated. Registering globally only."
+            )
+            tokens = []
         # Guild copies go out first and carry no context/install overrides: those
         # fields only mean something for global commands, and copy_global_to
         # shares them with the originals, so they must be synced before we set them.
