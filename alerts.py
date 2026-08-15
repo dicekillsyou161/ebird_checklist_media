@@ -1,12 +1,15 @@
 """Rare-bird alert subscriptions: who watches which region, and what they've seen.
 
-One JSON file holds every subscription. Each carries its own `seen` map, so a
-new subscriber never gets a backlog of the whole window and a bot restart never
-re-sends an alert that already went out.
+State lives in the shared SQLite database (see db.py). Each subscription
+carries its own `seen` map, so a new subscriber never gets a backlog of the
+whole window and a bot restart never re-sends an alert that already went out.
+A subscriptions.json from before the database is imported once and renamed
+*.migrated.
 """
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
@@ -34,6 +37,11 @@ RARITY_LABELS = dict(RARITY_LEVELS)
 
 NEW_REPORT = "new"       # nobody has been told about this report yet
 CONFIRMATION = "confirmed"  # already alerted while pending, now reviewed & accepted
+
+_SUB_COLUMNS = (
+    "user_id, region, region_label, min_rarity, confirmations, "
+    "created, alerts_sent, last_alert, paused, failures"
+)
 
 
 @dataclass
@@ -69,6 +77,28 @@ class Subscription:
     def to_dict(self) -> dict:
         return asdict(self)
 
+    def to_row(self) -> tuple:
+        return (
+            self.user_id, self.region, self.region_label, self.min_rarity,
+            int(self.confirmations), self.created, self.alerts_sent,
+            self.last_alert, int(self.paused), self.failures,
+        )
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> Subscription:
+        return cls(
+            user_id=row["user_id"],
+            region=row["region"],
+            region_label=row["region_label"],
+            min_rarity=row["min_rarity"],
+            confirmations=bool(row["confirmations"]),
+            created=row["created"],
+            alerts_sent=row["alerts_sent"],
+            last_alert=row["last_alert"],
+            paused=bool(row["paused"]),
+            failures=row["failures"],
+        )
+
     @property
     def display_region(self) -> str:
         return self.region_label or self.region
@@ -102,37 +132,92 @@ class Subscription:
 
 
 class AlertStore:
-    """The subscription list, persisted as JSON."""
+    """The subscription list, persisted in the bot's SQLite database.
 
-    def __init__(self, path: Path) -> None:
-        self.path = Path(path)
+    Subscriptions are worked on in memory exactly as before; `save()` writes
+    the whole current state in one transaction, so a crash mid-write can
+    never leave a half-updated list behind.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, legacy_json: Path | None = None) -> None:
+        self.conn = conn
         self.subscriptions: list[Subscription] = []
+        if legacy_json is not None:
+            self._import_legacy(Path(legacy_json))
         self.load()
 
-    def load(self) -> None:
+    def _import_legacy(self, path: Path) -> None:
+        """One-time import of a subscriptions.json from before the database."""
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            data = {}
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except OSError:
+            return  # no legacy file: nothing to migrate
+        except ValueError as error:
+            print(f"Ignoring unreadable {path.name}: {error}")
+            return
         raw = data.get("subscriptions") if isinstance(data, dict) else None
-        subscriptions = []
-        for entry in raw or []:
-            if not isinstance(entry, dict):
-                continue
-            try:
-                subscriptions.append(Subscription.from_dict(entry))
-            except (TypeError, ValueError, AttributeError) as error:
-                print(f"Skipping unreadable subscription in {self.path.name}: {error}")
+        imported = 0
+        with self.conn:
+            for entry in raw or []:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    sub = Subscription.from_dict(entry)
+                except (TypeError, ValueError, AttributeError) as error:
+                    print(f"Skipping unreadable subscription in {path.name}: {error}")
+                    continue
+                cursor = self.conn.execute(
+                    f"INSERT OR IGNORE INTO subscriptions ({_SUB_COLUMNS})"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    sub.to_row(),
+                )
+                if cursor.rowcount:
+                    imported += 1
+                    self.conn.executemany(
+                        "INSERT OR IGNORE INTO seen (user_id, region, key, obs_dt, status)"
+                        " VALUES (?, ?, ?, ?, ?)",
+                        [
+                            (sub.user_id, sub.region, key, value[0], value[1])
+                            for key, value in sub.seen.items()
+                        ],
+                    )
+        try:
+            path.replace(path.with_name(path.name + ".migrated"))
+            print(f"Imported {imported} subscription(s) from {path.name}.")
+        except OSError as error:
+            print(f"Imported {path.name} but couldn't rename it afterwards: {error}")
+
+    def load(self) -> None:
+        subscriptions: list[Subscription] = []
+        by_key: dict[tuple[str, str], Subscription] = {}
+        for row in self.conn.execute("SELECT * FROM subscriptions"):
+            sub = Subscription.from_row(row)
+            subscriptions.append(sub)
+            by_key[(sub.user_id, sub.region)] = sub
+        for row in self.conn.execute("SELECT user_id, region, key, obs_dt, status FROM seen"):
+            sub = by_key.get((row["user_id"], row["region"]))
+            if sub is not None:
+                sub.seen[row["key"]] = [row["obs_dt"], row["status"]]
         self.subscriptions = subscriptions
 
     def save(self) -> None:
-        payload = {"subscriptions": [sub.to_dict() for sub in self.subscriptions]}
-        temp = self.path.with_name(self.path.name + ".tmp")
-        try:
-            temp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-            temp.replace(self.path)  # atomic: a crash mid-write can't truncate the list
-        except OSError as error:
-            print(f"Couldn't save {self.path.name}: {error}")
+        """Persist the in-memory state: one transaction, all or nothing."""
+        with self.conn:
+            self.conn.execute("DELETE FROM subscriptions")  # seen rows cascade away
+            for sub in self.subscriptions:
+                self.conn.execute(
+                    f"INSERT INTO subscriptions ({_SUB_COLUMNS})"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    sub.to_row(),
+                )
+                self.conn.executemany(
+                    "INSERT INTO seen (user_id, region, key, obs_dt, status)"
+                    " VALUES (?, ?, ?, ?, ?)",
+                    [
+                        (sub.user_id, sub.region, key, value[0], value[1])
+                        for key, value in sub.seen.items()
+                    ],
+                )
 
     def find(self, user_id: str, region: str) -> Subscription | None:
         region = region.upper()
