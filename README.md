@@ -7,59 +7,85 @@ and a link to each photo's Macaulay Library page.
 ```
 /checklist S378216909
 /checklist https://ebird.org/checklist/S378216909
-/checklist -vvv S378216909
+/checklist S378216909 detail:Minimal
 ```
 
-Each photo is its own embed: the title links to the Macaulay Library asset
-page, the description repeats the link in copyable form, and the footer
-carries the ML catalog number and photographer credit. Photos are grouped by
-species and posted one message per photo, so each can be forwarded
-individually.
+Photos are grouped by species, one message per species. Discord renders
+embeds that share a link as a single card with a grid of images, so all of a
+species' photos ride on one card: the title links to the Macaulay Library
+asset page, the description repeats the link in copyable form, and the footer
+carries the ML catalog number, photographer credit, and the photo count.
+Only the first photo of each species contributes metadata; the rest add just
+their image, which keeps a 24-photo checklist to 10 messages instead of 24.
 
-Prefix the checklist with `-vvv` to attach each photo's full metadata to its
-embed: observed date/time, location, coordinates (linked to a map), age/sex
-counts, community rating, pixel dimensions, license ID, eBird species code,
-and any notes or tags on the asset.
+A card holds at most four images (Discord's limit), so a species with more
+photos continues on further image-only cards. For the full metadata or the
+camera EXIF of any individual photo, pass its catalog number to
+`/checkmedia ML662698120`.
 
 There is also `/checkmedia` for a single Macaulay Library asset:
 
 ```
 /checkmedia https://macaulaylibrary.org/asset/662698120
 /checkmedia ML662698120
-/checkmedia -ccc ML662698120
+/checkmedia ML662698120 detail:Minimal
 ```
 
-It posts that photo with *all* its metadata in one embed; everything `-vvv`
-shows, plus a link back to the asset's checklist and the camera EXIF the
-Macaulay Library displays on the asset page: camera make/model, lens, focal
-length, exposure, shutter speed, aperture, ISO, flash, capture timestamp, and
-GPS coordinates (when the uploaded file carried them). Assets with stripped
-EXIF get a "none available" note; audio/video assets show metadata and a link
-but no image.
+It posts that photo with *all* its metadata in one embed, plus a link back to
+the asset's checklist and the camera EXIF the Macaulay Library displays on
+the asset page: camera make/model, lens, focal length, exposure, aperture,
+ISO, flash, capture timestamp, and GPS coordinates (when the uploaded file
+carried them). Assets with stripped EXIF get a "none available"
+note; audio/video assets show metadata and a link but no image.
 
-Compact flags trim the embed down; more c's, more cut. All three keep the
-photo, species (common + scientific name), the Macaulay Library link, the
-checklist link, and the current community rating:
+## Where results appear
 
-| Flag   | Extra fields shown                                              |
-|--------|-----------------------------------------------------------------|
-| `-c`   | 📷 Focal length, 📷 Shutter speed, 📷 Aperture, 📷 ISO, Observed, Location |
-| `-cc`  | 📷 Focal length, Observed, Location                             |
-| `-ccc` | none                                                            |
+Only `/checkmedia` posts to the channel for everyone to see, which makes it
+the one to reach for when sharing a photo. Everything else keeps the channel
+clean:
 
-If several are given, the most-compact wins. On `/checklist`, any compact
-flag produces the default embeds plus the rating line (per-photo camera
-fields would need one page fetch per photo, so they're `/checkmedia`-only).
+| Command | Output |
+|---|---|
+| `/checkmedia` | posted publicly in the channel |
+| `/checklist`, `/top`, `/recent`, `/sp`, `/rare` | DMed to whoever ran it, with a dismissable "sent to your DMs" note |
+| `/alert`, `/alerts`, `/unalert`, `/iam` | dismissable replies only you can see |
+
+Results go to DMs rather than dismissable replies because dismissable
+(ephemeral) messages cannot be forwarded and vanish when the client reloads;
+DMs stay put and can be forwarded one by one. Run any of these commands
+*inside* a DM with the bot and the results simply post there in place. If
+your DMs are closed, the bot says so once and falls back to dismissable
+replies so nothing is lost.
+
+## The `detail` option
+
+`/checklist`, `/checkmedia`, `/top`, `/recent`, `/sp`, and `/rare` all take
+the same optional `detail` option, picked from a dropdown. Every level keeps
+the photo, species (common + scientific name), the Macaulay Library link, the
+checklist link, and the current community rating; the levels differ in what
+else they add:
+
+| `detail` | Extra fields shown |
+|---|---|
+| **Full** (default) | everything the asset has, plus all camera EXIF |
+| **Camera** | 📷 Focal length, 📷 Exposure, 📷 Aperture, 📷 ISO, Observed, Location |
+| **Brief** | 📷 Focal length, Observed, Location |
+| **Minimal** | none |
+
+Leaving it unset means Full. On `/checklist` the camera rows have nothing to
+fill in, because per-photo EXIF would need one extra page fetch per asset, so
+Camera and Brief both show just Observed and Location there; use
+`/checkmedia ML…` for a single photo's camera data.
 
 Finally, `/top` posts a user's highest-rated photos (Macaulay's
 "Best quality" ranking, `sort=rating_rank_desc`), one message per photo,
-with the same embeds and compact flags as `/checkmedia`. The optional
+with the same embeds and `detail` levels as `/checkmedia`. The optional
 `count` parameter picks how many (1–50, default 10):
 
 ```
 /top USER8940126
 /top ML662698120          (any asset by that person; resolves the photographer)
-/top -cc USER8940126 count:5
+/top USER8940126 count:5 detail:Brief
 /recent USER8940126       (same, but most recently uploaded instead of top rated)
 /recent USER8940126 obs:True   (sort by observation date/time instead of upload date)
 /sp species:black oystercatcher user:USER8940126   (one species, all media types)
@@ -191,7 +217,9 @@ Invite the bot to that server if you want shared output.
 .venv/bin/python ebird_media.py -vvv S378216909   # with per-photo metadata
 ```
 
-Prints every public photo with its species and Macaulay Library link.
+Prints every public photo with its species and Macaulay Library link. The
+command-line tester keeps its own `-vvv`, `-c`, `-cc`, and `-ccc` flags; they
+were only removed from the Discord commands, which use `detail` instead.
 
 ## Rare bird reports
 
@@ -201,7 +229,7 @@ public photos, newest first:
 ```
 /rare region:US-WA
 /rare region:king county wa count:5 days:7
-/rare region:-cc US-WA          (compact flags work here too)
+/rare region:US-WA detail:Brief (the detail option works here too)
 /rare region:US-WA text:True    (one summary embed, photos not required)
 ```
 
@@ -262,6 +290,12 @@ verified or not:
   that fails. After 3 consecutive failures a subscription pauses and `/alerts`
   shows it as paused; re-run `/alert` to resume. At most 10 DMs per region per
   poll, with the remainder carried to the next one.
+- **Shared polling**: a region is polled once per sweep no matter how many
+  people watch it, and the photo and rarity lookups behind those reports are
+  shared too, so eBird sees the same load whether one person or fifty watch
+  `US-WA-067`. Fetched feeds are also cached for two minutes and reused by
+  `/rare`, so a lookup right after a poll costs nothing. The poll itself
+  always reads fresh data, never the cache.
 - Subscriptions live in `subscriptions.json` beside `bot.py` (gitignored),
   written atomically and reloaded on restart, so a restart never re-sends an
   alert or forgets a subscriber.
