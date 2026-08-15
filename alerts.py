@@ -13,7 +13,7 @@ import sqlite3
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
-from ebird_media import STATUS_CONFIRMED, STATUS_PENDING
+from ebird_media import STATUS_CONFIRMED, STATUS_PENDING, STATUS_REJECTED
 
 # The tiers ebird_media assigns, ranked so a subscription can ask for
 # "this rare or rarer". Unknown labels (an eBird region with no photo history)
@@ -37,6 +37,13 @@ RARITY_LABELS = dict(RARITY_LEVELS)
 
 NEW_REPORT = "new"       # nobody has been told about this report yet
 CONFIRMATION = "confirmed"  # already alerted while pending, now reviewed & accepted
+
+STATUS_MARKS = {STATUS_CONFIRMED: "✅", STATUS_PENDING: "⏳", STATUS_REJECTED: "❌"}
+
+# One remembered report is [obs_dt, status, species, rarity]. The last two are
+# display-only, so /alerts can list recent reports without re-fetching anything;
+# they stay empty on rows written before they existed (or seeded pre-rating).
+_SEEN_WIDTH = 4
 
 _SUB_COLUMNS = (
     "user_id, region, region_label, min_rarity, confirmations, "
@@ -68,9 +75,9 @@ class Subscription:
         sub.user_id = str(sub.user_id)
         sub.region = str(sub.region).upper()
         sub.seen = {
-            str(key): [str(value[0]), str(value[1])]
+            str(key): ([str(part) for part in value] + [""] * _SEEN_WIDTH)[:_SEEN_WIDTH]
             for key, value in (sub.seen or {}).items()
-            if isinstance(value, (list, tuple)) and len(value) == 2
+            if isinstance(value, (list, tuple)) and 2 <= len(value) <= _SEEN_WIDTH
         }
         return sub
 
@@ -119,8 +126,21 @@ class Subscription:
     def wants_rarity(self, label: str) -> bool:
         return RARITY_RANK.get(label, 0) >= self.min_rarity
 
-    def mark_seen(self, key: str, obs_dt: str, status: str) -> None:
-        self.seen[key] = [obs_dt or "", status]
+    def mark_seen(
+        self, key: str, obs_dt: str, status: str, species: str = "", rarity: str = ""
+    ) -> None:
+        prior = self.seen.get(key)
+        if prior is not None:  # a status update mustn't blank what's already known
+            species = species or prior[2]
+            rarity = rarity or prior[3]
+        self.seen[key] = [obs_dt or "", status, species, rarity]
+
+    def recent_seen(self, limit: int = 3) -> list[tuple[str, list[str]]]:
+        """The newest remembered reports, for showing back in /alerts."""
+        newest_first = sorted(
+            self.seen.items(), key=lambda item: item[1][0], reverse=True
+        )
+        return newest_first[:limit]
 
     def prune(self, cutoff: str) -> bool:
         """Forget reports older than the poll window; they can't come back."""
@@ -174,10 +194,11 @@ class AlertStore:
                 if cursor.rowcount:
                     imported += 1
                     self.conn.executemany(
-                        "INSERT OR IGNORE INTO seen (user_id, region, key, obs_dt, status)"
-                        " VALUES (?, ?, ?, ?, ?)",
+                        "INSERT OR IGNORE INTO seen"
+                        " (user_id, region, key, obs_dt, status, species, rarity)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?)",
                         [
-                            (sub.user_id, sub.region, key, value[0], value[1])
+                            (sub.user_id, sub.region, key, *value)
                             for key, value in sub.seen.items()
                         ],
                     )
@@ -194,10 +215,14 @@ class AlertStore:
             sub = Subscription.from_row(row)
             subscriptions.append(sub)
             by_key[(sub.user_id, sub.region)] = sub
-        for row in self.conn.execute("SELECT user_id, region, key, obs_dt, status FROM seen"):
+        for row in self.conn.execute(
+            "SELECT user_id, region, key, obs_dt, status, species, rarity FROM seen"
+        ):
             sub = by_key.get((row["user_id"], row["region"]))
             if sub is not None:
-                sub.seen[row["key"]] = [row["obs_dt"], row["status"]]
+                sub.seen[row["key"]] = [
+                    row["obs_dt"], row["status"], row["species"], row["rarity"]
+                ]
         self.subscriptions = subscriptions
 
     def save(self) -> None:
@@ -211,10 +236,11 @@ class AlertStore:
                     sub.to_row(),
                 )
                 self.conn.executemany(
-                    "INSERT INTO seen (user_id, region, key, obs_dt, status)"
-                    " VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO seen"
+                    " (user_id, region, key, obs_dt, status, species, rarity)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
                     [
-                        (sub.user_id, sub.region, key, value[0], value[1])
+                        (sub.user_id, sub.region, key, *value)
                         for key, value in sub.seen.items()
                     ],
                 )
