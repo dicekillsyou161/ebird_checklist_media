@@ -67,14 +67,15 @@ else they add:
 
 | `detail` | Extra fields shown |
 |---|---|
-| **Full** (default) | everything the asset has, plus all camera EXIF |
+| **Brief** (default) | 📷 Focal length, Observed, Location |
 | **Camera** | 📷 Focal length, 📷 Exposure, 📷 Aperture, 📷 ISO, Observed, Location |
-| **Brief** | 📷 Focal length, Observed, Location |
+| **Full** | everything the asset has, plus all camera EXIF |
 | **Minimal** | none |
 
-Leaving it unset means Full. On `/checklist` the camera rows have nothing to
+Leaving it unset gives Brief, so results stay readable; ask for **Full** when
+you want the whole record. On `/checklist` the camera rows have nothing to
 fill in, because per-photo EXIF would need one extra page fetch per asset, so
-Camera and Brief both show just Observed and Location there; use
+Brief and Camera both show just Observed and Location there; use
 `/checkmedia ML…` for a single photo's camera data.
 
 Finally, `/top` posts a user's highest-rated photos (Macaulay's
@@ -85,7 +86,7 @@ with the same embeds and `detail` levels as `/checkmedia`. The optional
 ```
 /top USER8940126
 /top ML662698120          (any asset by that person; resolves the photographer)
-/top USER8940126 count:5 detail:Brief
+/top USER8940126 count:5 detail:Full
 /recent USER8940126       (same, but most recently uploaded instead of top rated)
 /recent USER8940126 obs:True   (sort by observation date/time instead of upload date)
 /sp species:black oystercatcher user:USER8940126   (one species, all media types)
@@ -229,7 +230,7 @@ public photos, newest first:
 ```
 /rare region:US-WA
 /rare region:king county wa count:5 days:7
-/rare region:US-WA detail:Brief (the detail option works here too)
+/rare region:US-WA detail:Full  (the detail option works here too)
 /rare region:US-WA text:True    (one summary embed, photos not required)
 ```
 
@@ -323,6 +324,23 @@ documentation, not sightings, and most eBird-flagged records are ordinary
 species out of range or season; those land in the bottom tiers, which is
 the honest answer. Regions with fewer than 500 prior photos fall back to
 all-time counts.
+
+## When the service won't start
+
+Run the preflight check on the box, as the service user; it reports the exact
+problem rather than leaving you to read a crash loop:
+
+```sh
+cd /opt/ebird-discord-bot && sudo -u ebird .venv/bin/python preflight.py
+```
+
+It verifies the three modules are present and import cleanly (a common cause
+is copying one file but not the others), the dependency versions, that the
+directory is writable, and that `DISCORD_TOKEN` is readable. For the raw
+error, `journalctl -u ebird-discord-bot -n 40 --no-pager` shows the traceback.
+
+Command registration can no longer take the bot down: if a sync fails, it
+logs why and keeps running with whatever commands Discord already has.
 
 ## Run as a systemd service
 
