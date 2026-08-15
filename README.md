@@ -136,8 +136,8 @@ Two friendlier forms also work everywhere a user is accepted:
 
 - **Display name** (`Mark Zorthesosen`, or any unambiguous fragment like
   `zorthesosen`); there's no public eBird name-search API, so the bot
-  *learns* names from every command result it sees (stored in
-  `aliases.json`). Once anyone has pulled a person's media by ID or asset
+  *learns* names from every command result it sees (kept in its database,
+  `bot.db`). Once anyone has pulled a person's media by ID or asset
   link, their name resolves; before that, the bot replies telling you how to
   teach it. Ambiguous fragments list the people they match.
 - **Discord @mention**; after a person links themselves once with
@@ -310,9 +310,9 @@ verified or not:
   `US-WA-067`. Fetched feeds are also cached for two minutes and reused by
   `/rare`, so a lookup right after a poll costs nothing. The poll itself
   always reads fresh data, never the cache.
-- Subscriptions live in `subscriptions.json` beside `bot.py` (gitignored),
-  written atomically and reloaded on restart, so a restart never re-sends an
-  alert or forgets a subscriber.
+- Subscriptions live in the bot's database (`bot.db`, see **Storage**),
+  written in single transactions and reloaded on restart, so a restart never
+  re-sends an alert or forgets a subscriber.
 
 ### How "level of rarity" is estimated
 
@@ -362,9 +362,26 @@ for a deployment at `/opt/ebird-discord-bot` running as the `ebird` user;
 edit the `WorkingDirectory`, `ExecStart`, and `User` lines to match your
 setup. `.env` is read from `WorkingDirectory`, so it must sit in the checkout
 alongside `bot.py`, readable by the service user (and ideally `chmod 600`).
-The service user also needs **write** access to that directory: the bot saves
-`subscriptions.json` (alert subscriptions) and `aliases.json` there, so
-`chown -R ebird: /opt/ebird-discord-bot` after deploying.
+The service user also needs **write** access to that directory: the bot keeps
+its database (`bot.db`) there, so `chown -R ebird: /opt/ebird-discord-bot`
+after deploying.
+
+### Storage
+
+Everything the bot remembers (learned display names, `/iam` links, alert
+subscriptions and their delivery history) lives in one SQLite database,
+`bot.db`, beside `bot.py`. No extra software is needed (`sqlite3` is in
+Python's standard library). The file is created readable by the service user
+only, since it holds Discord user IDs and watch lists; writes are real
+transactions, so a crash can never truncate or half-update the state the way
+an interrupted JSON rewrite could.
+
+On the first start after upgrading, any old `aliases.json` and
+`subscriptions.json` are imported automatically and renamed `*.migrated`;
+keep or delete those copies as you like. The `bot.db-wal` and `bot.db-shm`
+files beside the database are part of normal SQLite operation. To back it
+up, either copy `bot.db` while the bot is stopped or run
+`sqlite3 bot.db ".backup bot-backup.db"` while it's running.
 
 ```sh
 sudo useradd --system --shell /usr/sbin/nologin ebird   # once, if it doesn't exist
