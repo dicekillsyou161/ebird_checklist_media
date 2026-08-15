@@ -26,13 +26,13 @@ print(f"python {sys.version.split()[0]} at {sys.executable}")
 print(f"working directory: {HERE}\n")
 
 print("files")
-for name in ("bot.py", "ebird_media.py", "alerts.py"):
+for name in ("bot.py", "ebird_media.py", "alerts.py", "db.py"):
     check(name, (HERE / name).is_file(), "missing from this directory")
 check(".env", (HERE / ".env").is_file(), "missing; copy .env.example and add DISCORD_TOKEN")
 check(
     "directory is writable",
     os.access(HERE, os.W_OK),
-    "the service user cannot write subscriptions.json or aliases.json here",
+    "the service user cannot write bot.db (its database) here",
 )
 
 print("\ndependencies")
@@ -84,6 +84,16 @@ try:
         len(withdetail) == 6,
         "expected 6 (checklist, checkmedia, top, recent, sp, rare); the deployed "
         "files may be from different versions",
+    )
+    check("database bot.db opened", (HERE / "bot.db").is_file(), "not created")
+    leftovers = [
+        name for name in ("aliases.json", "subscriptions.json") if (HERE / name).exists()
+    ]
+    check(
+        "old JSON state migrated" + (f" (still present: {', '.join(leftovers)})" if leftovers else ""),
+        not leftovers,
+        "importing bot.py should have renamed them *.migrated; check write permissions",
+        fatal=False,
     )
 except Exception as error:  # noqa: BLE001 - this is the diagnostic
     check("bot.py imports", False, f"{type(error).__name__}: {error}")
