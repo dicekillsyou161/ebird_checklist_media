@@ -49,11 +49,20 @@ CREATE TABLE IF NOT EXISTS seen (
     key     TEXT NOT NULL,        -- checklist:species of a delivered report
     obs_dt  TEXT NOT NULL DEFAULT '',
     status  TEXT NOT NULL DEFAULT '',
+    species TEXT NOT NULL DEFAULT '',  -- common name, for showing back in /alerts
+    rarity  TEXT NOT NULL DEFAULT '',  -- "🟠 Very rare"; empty when never rated
     PRIMARY KEY (user_id, region, key),
     FOREIGN KEY (user_id, region)
         REFERENCES subscriptions (user_id, region) ON DELETE CASCADE
 );
 """
+
+# Columns added after a table first shipped; CREATE IF NOT EXISTS won't add
+# them to an existing database, so they are patched in on connect.
+_UPGRADES = (
+    ("seen", "species", "TEXT NOT NULL DEFAULT ''"),
+    ("seen", "rarity", "TEXT NOT NULL DEFAULT ''"),
+)
 
 
 def connect(path: Path | str) -> sqlite3.Connection:
@@ -64,6 +73,10 @@ def connect(path: Path | str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")  # crash-safe without blocking reads
     conn.execute("PRAGMA foreign_keys=ON")   # removing a subscription drops its seen rows
     conn.executescript(SCHEMA)
+    for table, column, definition in _UPGRADES:
+        present = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in present:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
     conn.commit()
     try:
         os.chmod(path, 0o600)
