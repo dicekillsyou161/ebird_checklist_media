@@ -54,12 +54,31 @@ load_dotenv()
 MAX_PHOTOS_POSTED = 50  # keep one command from flooding a channel
 FIELD_VALUE_MAX = 300            # display cap for one metadata value (Discord allows 1024)
 EMBED_COLOR = discord.Color.from_str("#4a7628")  # eBird green
-# Every command works in a server and in a DM with the bot. `private_channel`
-# (group DMs, other people's servers) stays off: that needs a user-installable
-# app, which is a separate opt-in in the Developer Portal.
-DM_AND_GUILD = app_commands.AppCommandContext(
-    guild=True, dm_channel=True, private_channel=False
-)
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in ("0", "false", "no", "off")
+
+
+# User-installable: the commands travel with your Discord account, so they work
+# in DMs, group DMs, and servers the bot itself hasn't joined. This requires
+# "User Install" to be enabled in the Developer Portal (Installation →
+# Installation Contexts); without it Discord rejects the sync and the bot falls
+# back to guild-install automatically.
+USER_INSTALL = _env_flag("USER_INSTALL", True)
+
+
+def command_scopes(user_install: bool):
+    """(where commands may run, how the app may be installed) for a global sync."""
+    return (
+        app_commands.AppCommandContext(
+            guild=True, dm_channel=True, private_channel=user_install
+        ),
+        app_commands.AppInstallationType(guild=True, user=user_install),
+    )
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -174,14 +193,21 @@ class ChecklistBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
         self.alert_task: asyncio.Task | None = None
 
+    def _scope(self, contexts, installs) -> None:
+        for command in self.tree.get_commands():
+            command.allowed_contexts = contexts
+            command.allowed_installs = installs
+
     async def setup_hook(self) -> None:
         self.alert_task = self.loop.create_task(alert_loop(), name="rare-bird-alerts")
-        for command in self.tree.get_commands():
-            command.allowed_contexts = DM_AND_GUILD
         raw = os.getenv("GUILD_ID", "")
         tokens = [token for token in re.split(r"[,\s]+", raw) if token]
         if not all(token.isdigit() for token in tokens):
             raise SystemExit(f"GUILD_ID must be numeric server IDs (comma-separated), got: {raw!r}")
+        # Guild copies go out first and carry no context/install overrides: those
+        # fields only mean something for global commands, and copy_global_to
+        # shares them with the originals, so they must be synced before we set them.
+        self._scope(None, None)
         for guild_id in tokens:
             # Guild copies appear instantly, which is what makes testing bearable.
             guild = discord.Object(id=int(guild_id))
@@ -196,12 +222,29 @@ class ChecklistBot(discord.Client):
                     "from the README (scope=bot+applications.commands), then restart."
                 )
         # Always register globally as well: guild-scoped commands never show up
-        # in DMs, so this is the registration that makes DM use possible. It can
-        # take up to an hour to propagate the first time.
+        # in DMs, so this is the registration that makes DM and user-install use
+        # possible. It can take up to an hour to propagate the first time.
+        self._scope(*command_scopes(USER_INSTALL))
         try:
             await self.tree.sync()
+            where = "servers, DMs, and anywhere you install it" if USER_INSTALL else "servers and DMs"
+            print(f"Commands registered globally for {where}.")
         except discord.HTTPException as error:
-            print(f"Global command sync failed ({error}); DM commands may be unavailable.")
+            if not USER_INSTALL:
+                print(f"Global command sync failed ({error}); DM commands may be unavailable.")
+                return
+            print(
+                f"Global sync with user install failed ({error}). Enable it at "
+                "https://discord.com/developers/applications → your app → Installation → "
+                "Installation Contexts → tick 'User Install', then restart. "
+                "Falling back to guild install for now."
+            )
+            self._scope(*command_scopes(False))
+            try:
+                await self.tree.sync()
+                print("Registered globally without user install; servers and DMs still work.")
+            except discord.HTTPException as retry_error:
+                print(f"Global command sync still failing ({retry_error}).")
 
 
 bot = ChecklistBot()
