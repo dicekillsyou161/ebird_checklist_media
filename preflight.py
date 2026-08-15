@@ -1,0 +1,109 @@
+"""Check a deployment without connecting to Discord.
+
+Run this on the server when the service won't start; it reports the exact
+problem instead of leaving you to read a crash loop:
+
+    /opt/ebird-discord-bot/.venv/bin/python preflight.py
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+problems: list[str] = []
+
+
+def check(label: str, ok: bool, detail: str = "", fatal: bool = True) -> bool:
+    print(f"  {'ok  ' if ok else 'FAIL'}  {label}{'' if ok else f': {detail}'}")
+    if not ok and fatal:
+        problems.append(f"{label}: {detail}")
+    return ok
+
+
+print(f"python {sys.version.split()[0]} at {sys.executable}")
+print(f"working directory: {HERE}\n")
+
+print("files")
+for name in ("bot.py", "ebird_media.py", "alerts.py"):
+    check(name, (HERE / name).is_file(), "missing from this directory")
+check(".env", (HERE / ".env").is_file(), "missing; copy .env.example and add DISCORD_TOKEN")
+check(
+    "directory is writable",
+    os.access(HERE, os.W_OK),
+    "the service user cannot write subscriptions.json or aliases.json here",
+)
+
+print("\ndependencies")
+try:
+    import discord
+
+    check(f"discord.py {discord.__version__}", True)
+    from discord import app_commands
+
+    modern = hasattr(app_commands, "AppCommandContext") and hasattr(
+        app_commands, "AppInstallationType"
+    )
+    check(
+        "user-install API (needs discord.py 2.4+)",
+        modern,
+        "too old for user install; upgrade with pip install -U -r requirements.txt",
+        fatal=False,
+    )
+except ImportError as error:
+    check("discord.py installed", False, str(error))
+try:
+    import aiohttp  # noqa: F401
+
+    check("aiohttp", True)
+except ImportError as error:
+    check("aiohttp", False, str(error))
+try:
+    import dotenv  # noqa: F401
+
+    check("python-dotenv", True)
+except ImportError as error:
+    check("python-dotenv", False, str(error))
+
+print("\nproject modules (a mismatch between deployed files shows up here)")
+try:
+    sys.path.insert(0, str(HERE))
+    import bot  # noqa: F401
+
+    check("bot.py imports", True)
+    names = sorted(c.name for c in bot.bot.tree.get_commands())
+    check(f"{len(names)} commands defined: {', '.join(names)}", bool(names), "none found")
+    withdetail = [
+        c.name
+        for c in bot.bot.tree.get_commands()
+        if any(p.name == "detail" for p in c.parameters)
+    ]
+    check(
+        f"detail option on {len(withdetail)} commands: {', '.join(withdetail) or 'nothing'}",
+        len(withdetail) == 6,
+        "expected 6 (checklist, checkmedia, top, recent, sp, rare); the deployed "
+        "files may be from different versions",
+    )
+except Exception as error:  # noqa: BLE001 - this is the diagnostic
+    check("bot.py imports", False, f"{type(error).__name__}: {error}")
+
+print("\nconfiguration")
+token = os.getenv("DISCORD_TOKEN", "")
+check("DISCORD_TOKEN set", bool(token), "not found in the environment or .env")
+guild = os.getenv("GUILD_ID", "")
+if guild:
+    check(
+        f"GUILD_ID={guild}",
+        all(part.strip().isdigit() for part in guild.replace(",", " ").split()),
+        "must be numeric server IDs, comma-separated",
+        fatal=False,
+    )
+
+print()
+if problems:
+    print(f"{len(problems)} problem(s) to fix:")
+    for item in problems:
+        print(f"  - {item}")
+    raise SystemExit(1)
+print("preflight passed; the service should start.")
