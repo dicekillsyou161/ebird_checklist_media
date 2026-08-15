@@ -21,9 +21,10 @@ from alerts import (
     Subscription,
 )
 from ebird_media import (
+    COMPACT_BRIEF_FLAG,
+    COMPACT_CAMERA_FLAG,
     COMPACT_FLAG,
     STATUS_REJECTED,
-    VERBOSE_FLAG,
     AssetDetails,
     ChecklistError,
     Photo,
@@ -33,7 +34,6 @@ from ebird_media import (
     RareReport,
     attach_photos,
     build_rare_reports,
-    extract_flags,
     fetch_asset_details,
     fetch_checklist_photos,
     fetch_notable,
@@ -43,7 +43,6 @@ from ebird_media import (
     notable_status,
     parse_asset_id,
     parse_checklist_id,
-    pick_compact_flag,
     region_name,
     resolve_region_code,
     select_fields,
@@ -54,6 +53,27 @@ load_dotenv()
 MAX_PHOTOS_POSTED = 50  # keep one command from flooding a channel
 FIELD_VALUE_MAX = 300            # display cap for one metadata value (Discord allows 1024)
 EMBED_COLOR = discord.Color.from_str("#4a7628")  # eBird green
+
+# One `detail` option on every command, in place of the old -c/-cc/-ccc/-vvv
+# text flags. Values are the internal compact-flag constants; "full" means none.
+DETAIL_FULL = "full"
+DETAIL_CHOICES = [
+    app_commands.Choice(name="Full: every detail, plus camera EXIF", value=DETAIL_FULL),
+    app_commands.Choice(
+        name="Camera: focal length, exposure, aperture, ISO, when and where",
+        value=COMPACT_CAMERA_FLAG,
+    ),
+    app_commands.Choice(name="Brief: focal length, when and where", value=COMPACT_BRIEF_FLAG),
+    app_commands.Choice(name="Minimal: species, links and rating only", value=COMPACT_FLAG),
+]
+DETAIL_HELP = "How much metadata to show (default: full)"
+
+
+def detail_flag(choice: app_commands.Choice[str] | None) -> str | None:
+    """The internal compact flag behind a `detail` choice; None means full detail."""
+    if choice is None or choice.value == DETAIL_FULL:
+        return None
+    return choice.value
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -261,6 +281,60 @@ async def on_ready() -> None:
     print(f"Logged in as {bot.user} — /checklist is ready; {alerts}")
 
 
+class Delivery:
+    """Where a command's output goes, so results stay out of busy channels.
+
+    Run from a server, results are DMed to whoever asked: that keeps the
+    channel clean and, unlike ephemeral replies, leaves real messages they can
+    forward. Run from a DM, results simply post in place. If the user's DMs are
+    shut, output falls back to dismissable (ephemeral) replies.
+    """
+
+    def __init__(self, interaction: discord.Interaction) -> None:
+        self.interaction = interaction
+        self.mode = "dm" if interaction.guild is not None else "here"
+        self._channel: discord.abc.Messageable | None = None
+
+    @property
+    def private_reply(self) -> bool:
+        return self.interaction.guild is not None
+
+    async def send(self, **kwargs) -> None:
+        """One message of results."""
+        if self.mode == "dm":
+            try:
+                if self._channel is None:
+                    self._channel = (
+                        self.interaction.user.dm_channel
+                        or await self.interaction.user.create_dm()
+                    )
+                await self._channel.send(**kwargs)
+                return
+            except (discord.Forbidden, discord.HTTPException):
+                self.mode = "ephemeral"  # deliver the rest here instead
+                await self.notice(
+                    "I couldn't DM you, so this is only visible to you here. Turn on "
+                    "Settings → Privacy & Safety → Direct Messages from server members "
+                    "to get results in your DMs, where they stay and can be forwarded."
+                )
+        await self.interaction.followup.send(ephemeral=self.mode == "ephemeral", **kwargs)
+
+    async def notice(self, text: str) -> None:
+        """A short reply to whoever ran the command, never to the channel."""
+        await self.interaction.followup.send(text, ephemeral=self.private_reply)
+
+    async def finish(self, summary: str) -> None:
+        """Tell the invoker where the results went, once they have gone."""
+        if self.mode == "dm":
+            await self.notice(summary)
+
+
+async def defer_privately(interaction: discord.Interaction) -> Delivery:
+    """Defer without showing anything in the channel, and pick a destination."""
+    await interaction.response.defer(ephemeral=interaction.guild is not None)
+    return Delivery(interaction)
+
+
 def build_embed(
     photo: Photo, *, verbose: bool = False, checklist_id: str = "", show_rating: bool = False
 ) -> discord.Embed:
@@ -290,28 +364,96 @@ def build_embed(
     return embed
 
 
+GALLERY_MAX = 4  # Discord merges at most four same-url embeds into one card
+
+
+def group_by_species(photos: list[Photo]) -> list[list[Photo]]:
+    """Consecutive runs of one species; fetch order already keeps them together."""
+    groups: list[list[Photo]] = []
+    for photo in photos:
+        if groups and groups[-1][0].common_name == photo.common_name:
+            groups[-1].append(photo)
+        else:
+            groups.append([photo])
+    return groups
+
+
+def build_photo_embed(photo: Photo, *, detail: str | None = None) -> discord.Embed:
+    """A checklist photo card at the chosen detail level.
+
+    Checklist photos carry no EXIF (that would need a page fetch per asset), so
+    the camera rows of the Camera and Brief levels have nothing to fill in and
+    those levels show only when and where.
+    """
+    embed = build_embed(photo, verbose=detail is None, show_rating=True)
+    if detail:
+        stand_in = AssetDetails(photo=photo, media_type="photo", checklist_id="", exif=())
+        for label, value, is_camera in select_fields(stand_in, detail):
+            embed.add_field(
+                name=f"📷 {label}" if is_camera else label,
+                value=value[:FIELD_VALUE_MAX],
+                inline=True,
+            )
+    return embed
+
+
+def build_species_messages(
+    photos: list[Photo], *, detail: str | None = None
+) -> list[list[discord.Embed]]:
+    """Embeds for one species, batched into messages.
+
+    Embeds that share a `url` are rendered by Discord as a single card with a
+    grid of images, so a species becomes one message instead of one per photo.
+    Only the first photo contributes metadata; the rest add just their image.
+    Beyond four photos the species spills into further gallery messages.
+    """
+    messages: list[list[discord.Embed]] = []
+    for start in range(0, len(photos), GALLERY_MAX):
+        batch = photos[start:start + GALLERY_MAX]
+        anchor = batch[0].asset_url  # the shared url is what triggers the merge
+        if start == 0:
+            lead = build_photo_embed(batch[0], detail=detail)
+            if len(photos) > 1:
+                lead.set_footer(text=f"{lead.footer.text} • {len(photos)} photos")
+        else:
+            lead = discord.Embed(color=EMBED_COLOR)
+            lead.set_image(url=batch[0].image_url(1200))
+        lead.url = anchor
+        embeds = [lead]
+        for photo in batch[1:]:
+            extra = discord.Embed(url=anchor, color=EMBED_COLOR)
+            extra.set_image(url=photo.image_url(1200))
+            embeds.append(extra)
+        messages.append(embeds)
+    return messages
+
+
 @bot.tree.command(
     name="checklist",
     description="Post all public Macaulay Library photos from an eBird checklist",
 )
 @app_commands.describe(
-    checklist="Checklist URL or ID, e.g. S378216909 — prefix with -vvv for full photo metadata"
+    checklist="Checklist URL or ID, e.g. S378216909",
+    detail=DETAIL_HELP,
 )
-async def checklist_command(interaction: discord.Interaction, checklist: str) -> None:
-    await interaction.response.defer()
-    flags, rest = extract_flags(checklist.split())
-    compact = pick_compact_flag(flags) is not None
-    verbose = VERBOSE_FLAG in flags and not compact
+@app_commands.choices(detail=DETAIL_CHOICES)
+async def checklist_command(
+    interaction: discord.Interaction,
+    checklist: str,
+    detail: app_commands.Choice[str] | None = None,
+) -> None:
+    delivery = await defer_privately(interaction)
+    flag = detail_flag(detail)
     try:
-        sub_id = parse_checklist_id(" ".join(rest))
+        sub_id = parse_checklist_id(checklist)
         photos = await fetch_checklist_photos(sub_id)
     except ChecklistError as error:
-        await interaction.followup.send(str(error))
+        await delivery.notice(str(error))
         return
 
     checklist_url = f"https://ebird.org/checklist/{sub_id}"
     if not photos:
-        await interaction.followup.send(
+        await delivery.notice(
             f"No public photos found on <{checklist_url}> — the checklist may be "
             "private, have no photos yet, or the ID may be wrong."
         )
@@ -322,22 +464,27 @@ async def checklist_command(interaction: discord.Interaction, checklist: str) ->
     first = photos[0]
     detail_bits = [bit for bit in (first.photographer, first.obs_date, first.location) if bit]
     plural = "s" if len(photos) != 1 else ""
-    await interaction.followup.send(
-        f"**{len(photos)} public photo{plural}** · "
+    await delivery.send(
+        content=f"**{len(photos)} public photo{plural}** · "
         f"{species_count} species · {' · '.join(detail_bits)}\n<{checklist_url}>"
     )
 
-    # one message per photo so each can be forwarded individually
-    for photo in photos[:MAX_PHOTOS_POSTED]:
-        await interaction.followup.send(
-            embed=build_embed(photo, verbose=verbose, show_rating=compact)
-        )
+    # one message per species: its photos ride along as a gallery on a single card
+    posted = 0
+    for group in group_by_species(photos):
+        if posted >= MAX_PHOTOS_POSTED:
+            break
+        allowed = group[:MAX_PHOTOS_POSTED - posted]
+        for embeds in build_species_messages(allowed, detail=flag):
+            await delivery.send(embeds=embeds)
+        posted += len(allowed)
 
     if len(photos) > MAX_PHOTOS_POSTED:
-        await interaction.followup.send(
-            f"…showing the first {MAX_PHOTOS_POSTED} of {len(photos)} photos — "
+        await delivery.send(
+            content=f"…showing the first {MAX_PHOTOS_POSTED} of {len(photos)} photos — "
             f"see the rest at <{checklist_url}>"
         )
+    await delivery.finish(f"Sent {posted} photo(s) from `{sub_id}` to your DMs.")
 
 
 @bot.tree.command(
@@ -345,14 +492,19 @@ async def checklist_command(interaction: discord.Interaction, checklist: str) ->
     description="Post one Macaulay Library photo with all its metadata, including camera EXIF",
 )
 @app_commands.describe(
-    media="Macaulay Library asset link or ML number — flags -c, -cc, -ccc trim the metadata (see README)"
+    media="Macaulay Library asset link or ML number, e.g. ML662698120",
+    detail=DETAIL_HELP,
 )
-async def checkmedia_command(interaction: discord.Interaction, media: str) -> None:
+@app_commands.choices(detail=DETAIL_CHOICES)
+async def checkmedia_command(
+    interaction: discord.Interaction,
+    media: str,
+    detail: app_commands.Choice[str] | None = None,
+) -> None:
     await interaction.response.defer()
-    flags, rest = extract_flags(media.split())
-    compact_flag = pick_compact_flag(flags)
+    compact_flag = detail_flag(detail)
     try:
-        asset_id = parse_asset_id(" ".join(rest))
+        asset_id = parse_asset_id(media)
         details = await fetch_asset_details(asset_id)
     except ChecklistError as error:
         await interaction.followup.send(str(error))
@@ -403,16 +555,13 @@ async def _send_user_photos(
     species: str = "",
     species_group: bool = False,
     region: str = "",
+    compact_flag: str | None = None,
+    delivery: Delivery | None = None,
 ) -> None:
     """Shared body of /top, /recent, /sp; `header` is formatted with n and sp."""
-    flags, rest = extract_flags(user.split())
-    if species:
-        species_flags, species_rest = extract_flags(species.split())
-        flags |= species_flags
-        species = " ".join(species_rest)
-    compact_flag = pick_compact_flag(flags)
+    delivery = delivery or Delivery(interaction)
     try:
-        user_ref = " ".join(rest)
+        user_ref = user.strip()
         user_ref = resolve_alias(user_ref) or user_ref
         result = await fetch_user_details(
             user_ref, count=count, sort=sort,
@@ -423,7 +572,7 @@ async def _send_user_photos(
             region=region,
         )
     except ChecklistError as error:
-        await interaction.followup.send(str(error))
+        await delivery.notice(str(error))
         return
     learn_names(
         [(result.display_name, result.user_id)]
@@ -432,12 +581,12 @@ async def _send_user_photos(
     if not result.details:
         target = f" of {result.species_display}" if result.species_display else ""
         if result.user_id:
-            await interaction.followup.send(
+            await delivery.notice(
                 f"No public media{target} found for `{result.user_id}` — check the ID, "
                 "or pass one of their Macaulay Library asset links."
             )
         else:
-            await interaction.followup.send(f"No public media{target} found.")
+            await delivery.notice(f"No public media{target} found.")
         return
 
     catalog = f"https://media.ebird.org/catalog?sort={sort}"
@@ -453,9 +602,10 @@ async def _send_user_photos(
     if result.display_name:
         bits.append(result.display_name)
     bits.append(f"[full gallery](<{catalog}>)")
-    await interaction.followup.send(" · ".join(bits))
+    await delivery.send(content=" · ".join(bits))
     for details in result.details:
-        await interaction.followup.send(embed=build_asset_embed(details, compact_flag))
+        await delivery.send(embed=build_asset_embed(details, compact_flag))
+    await delivery.finish(f"Sent {len(result.details)} item(s) to your DMs.")
 
 
 @bot.tree.command(
@@ -468,7 +618,9 @@ async def _send_user_photos(
     count="How many to post (1–50, default 10)",
     group="Match every species with this in its name (e.g. all puffins; global if no user)",
     region="Limit species matches and media to a region — code (US-WA) or name (washington)",
+    detail=DETAIL_HELP,
 )
+@app_commands.choices(detail=DETAIL_CHOICES)
 async def sp_command(
     interaction: discord.Interaction,
     species: str,
@@ -476,11 +628,13 @@ async def sp_command(
     count: app_commands.Range[int, 1, 50] = 10,
     group: bool = False,
     region: str = "",
+    detail: app_commands.Choice[str] | None = None,
 ) -> None:
-    await interaction.response.defer()
+    delivery = await defer_privately(interaction)
     await _send_user_photos(
         interaction, user, count, SORT_BEST, "{n} media of {sp}",
         species=species, species_group=group, region=region,
+        compact_flag=detail_flag(detail), delivery=delivery,
     )
 
 
@@ -489,16 +643,22 @@ async def sp_command(
     description="Post an eBird user's top highest-rated photos",
 )
 @app_commands.describe(
-    user="Their USER… ID or any ML asset link by them — flags -c, -cc, -ccc as in /checkmedia",
+    user="Their USER… ID, name, @mention, or any ML asset link by them",
     count="How many photos to post (1–50, default 10)",
+    detail=DETAIL_HELP,
 )
+@app_commands.choices(detail=DETAIL_CHOICES)
 async def top_command(
     interaction: discord.Interaction,
     user: str,
     count: app_commands.Range[int, 1, 50] = 10,
+    detail: app_commands.Choice[str] | None = None,
 ) -> None:
-    await interaction.response.defer()
-    await _send_user_photos(interaction, user, count, SORT_BEST, "Top {n} rated photos")
+    delivery = await defer_privately(interaction)
+    await _send_user_photos(
+        interaction, user, count, SORT_BEST, "Top {n} rated photos",
+        compact_flag=detail_flag(detail), delivery=delivery,
+    )
 
 
 @bot.tree.command(
@@ -506,24 +666,30 @@ async def top_command(
     description="Post an eBird user's most recently uploaded photos",
 )
 @app_commands.describe(
-    user="Their USER… ID or any ML asset link by them — flags -c, -cc, -ccc as in /checkmedia",
+    user="Their USER… ID, name, @mention, or any ML asset link by them",
     count="How many photos to post (1–50, default 10)",
     obs="Sort by observation date/time instead of upload date",
+    detail=DETAIL_HELP,
 )
+@app_commands.choices(detail=DETAIL_CHOICES)
 async def recent_command(
     interaction: discord.Interaction,
     user: str,
     count: app_commands.Range[int, 1, 50] = 10,
     obs: bool = False,
+    detail: app_commands.Choice[str] | None = None,
 ) -> None:
-    await interaction.response.defer()
+    delivery = await defer_privately(interaction)
+    flag = detail_flag(detail)
     if obs:
         await _send_user_photos(
-            interaction, user, count, SORT_OBS, "{n} most recent photos by observation date"
+            interaction, user, count, SORT_OBS, "{n} most recent photos by observation date",
+            compact_flag=flag, delivery=delivery,
         )
     else:
         await _send_user_photos(
-            interaction, user, count, SORT_RECENT, "{n} most recently uploaded photos"
+            interaction, user, count, SORT_RECENT, "{n} most recently uploaded photos",
+            compact_flag=flag, delivery=delivery,
         )
 
 
@@ -597,12 +763,14 @@ def build_rare_embed(report: RareReport, compact_flag: str | None) -> discord.Em
     description="Recent eBird-confirmed rare bird reports with photos for a region",
 )
 @app_commands.describe(
-    region="eBird region — code (US-WA, US-WA-033) or name (washington); -c/-cc/-ccc flags allowed",
+    region="eBird region — code (US-WA, US-WA-033) or name (king county wa)",
     count="How many reports to post (1–25, default 10)",
     days="How many days back to search (1–30, default 14)",
     repeats="Allow several reports of the same species (default: most recent of each)",
     text="Text-only: drop the photo requirement and post one summary embed",
+    detail=DETAIL_HELP,
 )
+@app_commands.choices(detail=DETAIL_CHOICES)
 async def rare_command(
     interaction: discord.Interaction,
     region: str,
@@ -610,39 +778,41 @@ async def rare_command(
     days: app_commands.Range[int, 1, 30] = 14,
     repeats: bool = False,
     text: bool = False,
+    detail: app_commands.Choice[str] | None = None,
 ) -> None:
-    await interaction.response.defer()
-    flags, rest = extract_flags(region.split())
-    compact_flag = pick_compact_flag(flags)
+    delivery = await defer_privately(interaction)
+    compact_flag = detail_flag(detail)
     try:
         region_code, reports = await fetch_rare_reports(
-            " ".join(rest), count=count, days=days, unique_species=not repeats,
+            region, count=count, days=days, unique_species=not repeats,
             require_photo=not text,
             include_exif=not text and compact_flag != COMPACT_FLAG,
         )
     except ChecklistError as error:
-        await interaction.followup.send(str(error))
+        await delivery.notice(str(error))
         return
     if not reports:
         qualifier = "" if text else " with public photos"
-        await interaction.followup.send(
+        await delivery.notice(
             f"No eBird-confirmed rarities{qualifier} in `{region_code}` "
             f"over the last {days} days."
         )
         return
 
     if text:
-        await interaction.followup.send(embed=build_rare_digest(region_code, days, reports))
+        await delivery.send(embed=build_rare_digest(region_code, days, reports))
+        await delivery.finish(f"Sent the `{region_code}` rarity digest to your DMs.")
         return
 
     learn_names([(r.details.photo.photographer, r.details.photo.user_id) for r in reports if r.details])
     plural = "ies" if len(reports) != 1 else "y"
-    await interaction.followup.send(
-        f"**{len(reports)} confirmed rarit{plural} with photos** · `{region_code}` · "
+    await delivery.send(
+        content=f"**{len(reports)} confirmed rarit{plural} with photos** · `{region_code}` · "
         f"last {days} days · [region page](<https://ebird.org/region/{region_code}>)"
     )
     for report in reports:
-        await interaction.followup.send(embed=build_rare_embed(report, compact_flag))
+        await delivery.send(embed=build_rare_embed(report, compact_flag))
+    await delivery.finish(f"Sent {len(reports)} rarity report(s) to your DMs.")
 
 
 @bot.tree.command(
@@ -655,14 +825,15 @@ async def iam_command(interaction: discord.Interaction, user: str) -> None:
     try:
         result = await fetch_user_details(user.strip(), count=1, include_exif=False)
     except ChecklistError as error:
-        await interaction.followup.send(str(error))
+        await interaction.followup.send(str(error), ephemeral=True)
         return
     _registry["discord"][str(interaction.user.id)] = result.user_id
     _save_registry()
     learn_names([(result.display_name, result.user_id)])
     await interaction.followup.send(
         f"Linked! You are **{result.display_name}** (`{result.user_id}`) — your @mention "
-        "and display name now work in /top, /recent, and /sp."
+        "and display name now work in /top, /recent, and /sp.",
+        ephemeral=True,
     )
 
 
@@ -859,7 +1030,7 @@ async def alert_command(
             # dump days of backlog into the user's DMs
             backlog = await fetch_notable(code, days=ALERT_WINDOW_DAYS, session=session)
     except ChecklistError as error:
-        await interaction.followup.send(str(error))
+        await interaction.followup.send(str(error), ephemeral=True)
         return
 
     subscription = Subscription(
@@ -897,7 +1068,7 @@ async def alert_command(
             "Direct Messages** for this server, or alerts will pause after "
             f"{ALERT_FAILURE_LIMIT} failures."
         )
-    await interaction.followup.send(summary)
+    await interaction.followup.send(summary, ephemeral=True)
 
 
 @bot.tree.command(name="alerts", description="Show your rare bird alert subscriptions")
@@ -906,7 +1077,8 @@ async def alerts_command(interaction: discord.Interaction) -> None:
     mine = store.for_user(str(interaction.user.id))
     if not mine:
         await interaction.followup.send(
-            "No alert subscriptions yet. Start one with `/alert region:king county wa`."
+            "No alert subscriptions yet. Start one with `/alert region:king county wa`.",
+            ephemeral=True,
         )
         return
     lines = []
@@ -927,7 +1099,7 @@ async def alerts_command(interaction: discord.Interaction) -> None:
         color=EMBED_COLOR,
     )
     embed.set_footer(text=f"Checked every {ALERT_INTERVAL_SECONDS // 60} min · /unalert to stop one")
-    await interaction.followup.send(embed=embed)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="unalert", description="Stop rare bird alerts for a region")
@@ -940,22 +1112,26 @@ async def unalert_command(interaction: discord.Interaction, region: str = "") ->
         store.save()
         await interaction.followup.send(
             f"Cancelled {removed} alert subscription(s)." if removed
-            else "You had no alert subscriptions."
+            else "You had no alert subscriptions.",
+            ephemeral=True,
         )
         return
     try:
         code = await resolve_region_code(region)
     except ChecklistError as error:
-        await interaction.followup.send(str(error))
+        await interaction.followup.send(str(error), ephemeral=True)
         return
     dropped = store.remove(user_id, code)
     store.save()
     if dropped is None:
         await interaction.followup.send(
-            f"You weren't watching `{code}`. Use `/alerts` to see your subscriptions."
+            f"You weren't watching `{code}`. Use `/alerts` to see your subscriptions.",
+            ephemeral=True,
         )
         return
-    await interaction.followup.send(f"Stopped alerts for **{dropped.display_region}** (`{code}`).")
+    await interaction.followup.send(
+        f"Stopped alerts for **{dropped.display_region}** (`{code}`).", ephemeral=True
+    )
 
 
 def main() -> None:
