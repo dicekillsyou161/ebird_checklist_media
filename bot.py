@@ -902,7 +902,11 @@ async def poll_region(
     region: str, subscriptions: list[Subscription], session: aiohttp.ClientSession
 ) -> bool:
     """Alert every subscriber of this region about what they haven't seen. True if state changed."""
-    observations = await fetch_notable(region, days=ALERT_WINDOW_DAYS, session=session)
+    # max_age=0: alerts must never run on a cached feed, or a poll could miss
+    # reports that landed since the last fetch
+    observations = await fetch_notable(
+        region, days=ALERT_WINDOW_DAYS, session=session, max_age=0
+    )
     per_species = Counter(obs.get("speciesCode") for obs in observations)
 
     # one entry per (checklist, species), keeping the latest review state
