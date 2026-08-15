@@ -3,3 +3,8 @@
 __pycache__/
 aliases.json
 subscriptions.json
+subscriptions.json.tmp
+bot.db
+bot.db-wal
+bot.db-shm
+*.migrated
