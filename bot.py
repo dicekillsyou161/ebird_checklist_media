@@ -54,6 +54,12 @@ load_dotenv()
 MAX_PHOTOS_POSTED = 50  # keep one command from flooding a channel
 FIELD_VALUE_MAX = 300            # display cap for one metadata value (Discord allows 1024)
 EMBED_COLOR = discord.Color.from_str("#4a7628")  # eBird green
+# Every command works in a server and in a DM with the bot. `private_channel`
+# (group DMs, other people's servers) stays off: that needs a user-installable
+# app, which is a separate opt-in in the Developer Portal.
+DM_AND_GUILD = app_commands.AppCommandContext(
+    guild=True, dm_channel=True, private_channel=False
+)
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -170,26 +176,32 @@ class ChecklistBot(discord.Client):
 
     async def setup_hook(self) -> None:
         self.alert_task = self.loop.create_task(alert_loop(), name="rare-bird-alerts")
+        for command in self.tree.get_commands():
+            command.allowed_contexts = DM_AND_GUILD
         raw = os.getenv("GUILD_ID", "")
         tokens = [token for token in re.split(r"[,\s]+", raw) if token]
         if not all(token.isdigit() for token in tokens):
             raise SystemExit(f"GUILD_ID must be numeric server IDs (comma-separated), got: {raw!r}")
-        if tokens:
-            # Register instantly in these servers; global sync can take up to an hour.
-            for guild_id in tokens:
-                guild = discord.Object(id=int(guild_id))
-                self.tree.copy_global_to(guild=guild)
-                try:
-                    await self.tree.sync(guild=guild)
-                except discord.Forbidden:
-                    print(
-                        f"Can't register commands in server {guild_id}: the bot either "
-                        "isn't in that server or was invited without the "
-                        "applications.commands scope. Re-invite it with the OAuth URL "
-                        "from the README (scope=bot+applications.commands), then restart."
-                    )
-        else:
+        for guild_id in tokens:
+            # Guild copies appear instantly, which is what makes testing bearable.
+            guild = discord.Object(id=int(guild_id))
+            self.tree.copy_global_to(guild=guild)
+            try:
+                await self.tree.sync(guild=guild)
+            except discord.Forbidden:
+                print(
+                    f"Can't register commands in server {guild_id}: the bot either "
+                    "isn't in that server or was invited without the "
+                    "applications.commands scope. Re-invite it with the OAuth URL "
+                    "from the README (scope=bot+applications.commands), then restart."
+                )
+        # Always register globally as well: guild-scoped commands never show up
+        # in DMs, so this is the registration that makes DM use possible. It can
+        # take up to an hour to propagate the first time.
+        try:
             await self.tree.sync()
+        except discord.HTTPException as error:
+            print(f"Global command sync failed ({error}); DM commands may be unavailable.")
 
 
 bot = ChecklistBot()
