@@ -31,9 +31,15 @@ REGION_LIST_URL = "https://api.ebird.org/v2/ref/region/list/{kind}/{parent}"
 SPPLIST_URL = "https://api.ebird.org/v2/product/spplist/{region_code}"
 TAXONOMY_URL = "https://api.ebird.org/v2/ref/taxonomy/ebird"
 NOTABLE_URL = "https://api.ebird.org/v2/data/obs/{region_code}/recent/notable"
+REGION_INFO_URL = "https://api.ebird.org/v2/ref/region/info/{region_code}"
 MEDIA_COUNT_URL = "https://media.ebird.org/api/v2/stats/media-count"
 NOTABLE_MAX_DAYS = 30  # eBird's cap on the `back` window
 RARE_SCAN_MAX = 120    # most candidate reports to check for usable media
+
+# Where eBird's regional review stands on a flagged record.
+STATUS_CONFIRMED = "confirmed"  # a reviewer accepted it
+STATUS_PENDING = "pending"      # flagged, nobody has looked yet
+STATUS_REJECTED = "rejected"    # reviewed and not accepted
 
 # Rarity tiers by the species' share of the region's photos from *earlier* years —
 # an effort-normalized proxy for how seldom it is documented there. Excluding the
@@ -203,10 +209,35 @@ class RareReport:
     rarity_share: float | None  # % of the region's photos, None if unknown
     rarity_note: str            # e.g. "8 prior photos in US-WA"
     details: AssetDetails | None   # None in text mode, where photos aren't fetched
+    status: str = STATUS_CONFIRMED
+    latitude: float | None = None
+    longitude: float | None = None
+    how_many: int | None = None    # birds reported, when the observer counted
 
     @property
     def checklist_url(self) -> str:
         return f"https://ebird.org/checklist/{self.checklist_id}"
+
+    @property
+    def map_url(self) -> str:
+        if self.latitude is None or self.longitude is None:
+            return ""
+        return (
+            "https://www.google.com/maps/search/?api=1"
+            f"&query={self.latitude},{self.longitude}"
+        )
+
+    @property
+    def confirmed(self) -> bool:
+        return self.status == STATUS_CONFIRMED
+
+    @property
+    def status_display(self) -> str:
+        if self.status == STATUS_CONFIRMED:
+            return "✅ Reviewed & accepted"
+        if self.status == STATUS_REJECTED:
+            return "❌ Reviewed & not accepted"
+        return "⏳ Unconfirmed — awaiting eBird review"
 
     @property
     def rarity_display(self) -> str:
@@ -543,6 +574,47 @@ async def resolve_region(text: str, *, session: aiohttp.ClientSession) -> str:
         f"Couldn't find region “{raw}”; use an eBird code (US, US-WA, US-WA-033), "
         "a name like “washington”, or a county with its state like “king county wa”."
     )
+
+
+async def resolve_region_code(
+    text: str, *, session: aiohttp.ClientSession | None = None
+) -> str:
+    """`resolve_region` for callers that don't already hold a session."""
+    owns_session = session is None
+    if owns_session:
+        session = aiohttp.ClientSession()
+    try:
+        return await resolve_region(text, session=session)
+    except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+        raise ChecklistError(f"Couldn't reach eBird ({error.__class__.__name__}).") from error
+    finally:
+        if owns_session:
+            await session.close()
+
+
+_REGION_NAME_CACHE: dict[str, str] = {}
+
+
+async def region_name(region_code: str, *, session: aiohttp.ClientSession) -> str:
+    """"Washington, United States" for US-WA; the code itself if eBird won't say."""
+    if region_code in _REGION_NAME_CACHE:
+        return _REGION_NAME_CACHE[region_code]
+    name = region_code
+    try:
+        async with session.get(
+            REGION_INFO_URL.format(region_code=region_code),
+            params={"key": EBIRD_WEB_KEY},
+            headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as resp:
+            if resp.status == 200:
+                payload = await resp.json(content_type=None)
+                if isinstance(payload, dict) and payload.get("result"):
+                    name = str(payload["result"])
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        pass  # cosmetic; the code reads fine on its own
+    _REGION_NAME_CACHE[region_code] = name
+    return name
 
 
 _REGION_SPECIES_CACHE: dict[str, frozenset[str]] = {}
@@ -1022,6 +1094,141 @@ async def _rarity(
     return "Locally notable", "⚪", share, note
 
 
+def notable_key(obs: dict) -> str:
+    """One species on one checklist — the identity of a single rare-bird report."""
+    return f"{obs.get('subId') or ''}:{obs.get('speciesCode') or ''}"
+
+
+def notable_status(obs: dict) -> str:
+    """Where eBird's review stands on a flagged record.
+
+    Flagged observations enter the feed unreviewed (`obsValid` false,
+    `obsReviewed` false) and flip to valid once a regional reviewer accepts
+    them; reviewed-but-invalid means the record was not accepted.
+    """
+    if obs.get("obsValid"):
+        return STATUS_CONFIRMED
+    return STATUS_REJECTED if obs.get("obsReviewed") else STATUS_PENDING
+
+
+async def fetch_notable(
+    region_code: str, *, days: int = 14, session: aiohttp.ClientSession | None = None
+) -> list[dict]:
+    """Raw notable-sightings feed for an already-resolved region code.
+
+    Includes records at every review stage; use `notable_status` to tell them
+    apart. `days` is capped at eBird's 30-day maximum.
+    """
+    owns_session = session is None
+    if owns_session:
+        session = aiohttp.ClientSession()
+    try:
+        days = max(1, min(days, NOTABLE_MAX_DAYS))
+        async with session.get(
+            NOTABLE_URL.format(region_code=region_code),
+            params={"key": EBIRD_WEB_KEY, "back": str(days), "detail": "full"},
+            headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            if resp.status != 200:
+                raise ChecklistError(
+                    f"eBird returned HTTP {resp.status} for notable sightings in "
+                    f"`{region_code}` — check the region."
+                )
+            observations = await resp.json(content_type=None)
+    except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+        raise ChecklistError(f"Couldn't reach eBird ({error.__class__.__name__}).") from error
+    finally:
+        if owns_session:
+            await session.close()
+    if not isinstance(observations, list):
+        raise ChecklistError("Unexpected response from eBird's notable-sightings feed.")
+    return observations
+
+
+async def _first_photo(
+    obs: dict, session: aiohttp.ClientSession, semaphore: asyncio.Semaphore
+) -> tuple[dict, dict | None]:
+    """The observation paired with its first public photo, or None if it has none."""
+    if not obs.get("hasRichMedia"):
+        return obs, None
+    async with semaphore:
+        page = await _search(
+            session, subId=obs["subId"], taxonCode=obs["speciesCode"],
+            mediaType="photo", count=1, unconfirmed="incl",
+        )
+    return obs, (page[0] if page else None)
+
+
+async def attach_photos(
+    observations: list[dict], *, session: aiohttp.ClientSession, concurrency: int = 6
+) -> list[tuple[dict, dict | None]]:
+    """Pair every observation with a photo where one is actually indexed."""
+    semaphore = asyncio.Semaphore(concurrency)
+    return list(await asyncio.gather(
+        *(_first_photo(obs, session, semaphore) for obs in observations)
+    ))
+
+
+async def build_rare_reports(
+    region_code: str,
+    selected: list[tuple[dict, dict | None]],
+    *,
+    session: aiohttp.ClientSession,
+    per_species: Counter | None = None,
+    include_exif: bool = False,
+) -> list[RareReport]:
+    """Turn (observation, photo) pairs into reports: camera data, rarity, text."""
+    if not selected:
+        return []
+    if per_species is None:
+        per_species = Counter(obs.get("speciesCode") for obs, _ in selected)
+    if include_exif:
+        exif_sem = asyncio.Semaphore(4)
+
+        async def grab(item: dict | None) -> tuple[tuple[str, str], ...]:
+            if not item:
+                return ()
+            async with exif_sem:
+                return await _fetch_exif(session, item["assetId"])
+
+        exifs = await asyncio.gather(*(grab(item) for _, item in selected))
+    else:
+        exifs = [()] * len(selected)
+
+    await _warm_rarity_baseline(region_code, session)
+    rarity_sem = asyncio.Semaphore(4)
+
+    async def rarity_for(species_code: str):
+        async with rarity_sem:
+            return await _rarity(region_code, species_code, session)
+
+    rarities = await asyncio.gather(*(rarity_for(obs["speciesCode"]) for obs, _ in selected))
+
+    reports = []
+    for (obs, item), exif, (label, emoji, share, note) in zip(selected, exifs, rarities):
+        reports.append(RareReport(
+            common_name=obs.get("comName") or "Unknown species",
+            sci_name=obs.get("sciName") or "",
+            species_code=obs.get("speciesCode") or "",
+            obs_dt=obs.get("obsDt") or "",
+            location=obs.get("locName") or "",
+            observer=obs.get("userDisplayName") or "",
+            checklist_id=obs.get("subId") or "",
+            reports_in_window=per_species.get(obs.get("speciesCode"), 0),
+            rarity_label=label,
+            rarity_emoji=emoji,
+            rarity_share=share,
+            rarity_note=note,
+            details=_item_to_details(item, exif) if item else None,
+            status=notable_status(obs),
+            latitude=obs.get("lat"),
+            longitude=obs.get("lng"),
+            how_many=obs.get("howMany"),
+        ))
+    return reports
+
+
 async def fetch_rare_reports(
     region: str,
     *,
@@ -1044,22 +1251,7 @@ async def fetch_rare_reports(
         session = aiohttp.ClientSession()
     try:
         region_code = await resolve_region(region, session=session)
-        days = max(1, min(days, NOTABLE_MAX_DAYS))
-        async with session.get(
-            NOTABLE_URL.format(region_code=region_code),
-            params={"key": EBIRD_WEB_KEY, "back": str(days), "detail": "full"},
-            headers={"Accept": "application/json", "User-Agent": USER_AGENT},
-            timeout=aiohttp.ClientTimeout(total=30),
-        ) as resp:
-            if resp.status != 200:
-                raise ChecklistError(
-                    f"eBird returned HTTP {resp.status} for notable sightings in "
-                    f"`{region_code}` — check the region."
-                )
-            observations = await resp.json(content_type=None)
-        if not isinstance(observations, list):
-            raise ChecklistError("Unexpected response from eBird's notable-sightings feed.")
-
+        observations = await fetch_notable(region_code, days=days, session=session)
         per_species = Counter(o.get("speciesCode") for o in observations)
         # "confirmed" = a regional reviewer accepted the record; hasRichMedia
         # is eBird's own flag that something was attached (photo, audio or video)
@@ -1083,23 +1275,15 @@ async def fetch_rare_reports(
 
         semaphore = asyncio.Semaphore(6)
 
-        async def first_photo(obs: dict) -> tuple[dict, dict | None]:
-            if not obs.get("hasRichMedia"):
-                return obs, None
-            async with semaphore:
-                page = await _search(
-                    session, subId=obs["subId"], taxonCode=obs["speciesCode"],
-                    mediaType="photo", count=1, unconfirmed="incl",
-                )
-            return obs, (page[0] if page else None)
-
         # hasRichMedia doesn't guarantee an indexed public photo, so walk the
         # candidates newest-first and keep the ones that really have one
         selected: list[tuple[dict, dict | None]] = []
         if not require_photo:
             # keep every confirmed report, but still resolve a photo where eBird
             # flags one, so callers can mark which reports have imagery
-            selected = list(await asyncio.gather(*(first_photo(o) for o in ordered[:count])))
+            selected = list(await asyncio.gather(
+                *(_first_photo(o, session, semaphore) for o in ordered[:count])
+            ))
         else:
             pool = ordered[:RARE_SCAN_MAX]
             batch = max(count, 8)
@@ -1107,50 +1291,54 @@ async def fetch_rare_reports(
                 if len(selected) >= count:
                     break
                 for obs, item in await asyncio.gather(
-                    *(first_photo(o) for o in pool[start:start + batch])
+                    *(_first_photo(o, session, semaphore) for o in pool[start:start + batch])
                 ):
                     if item is not None and len(selected) < count:
                         selected.append((obs, item))
 
-        if include_exif and require_photo and selected:
-            exif_sem = asyncio.Semaphore(4)
-
-            async def grab(item: dict) -> tuple[tuple[str, str], ...]:
-                async with exif_sem:
-                    return await _fetch_exif(session, item["assetId"])
-
-            exifs = await asyncio.gather(*(grab(item) for _, item in selected if item))
-        else:
-            exifs = [()] * len(selected)
-        await _warm_rarity_baseline(region_code, session)
-        rarity_sem = asyncio.Semaphore(4)
-
-        async def rarity_for(species_code: str):
-            async with rarity_sem:
-                return await _rarity(region_code, species_code, session)
-
-        rarities = await asyncio.gather(*(rarity_for(obs["speciesCode"]) for obs, _ in selected))
-
-        reports = []
-        for (obs, item), exif, (label, emoji, share, note) in zip(selected, exifs, rarities):
-            reports.append(RareReport(
-                common_name=obs.get("comName") or "Unknown species",
-                sci_name=obs.get("sciName") or "",
-                species_code=obs.get("speciesCode") or "",
-                obs_dt=obs.get("obsDt") or "",
-                location=obs.get("locName") or "",
-                observer=obs.get("userDisplayName") or "",
-                checklist_id=obs.get("subId") or "",
-                reports_in_window=per_species.get(obs.get("speciesCode"), 0),
-                rarity_label=label,
-                rarity_emoji=emoji,
-                rarity_share=share,
-                rarity_note=note,
-                details=_item_to_details(item, exif) if item else None,
-            ))
+        reports = await build_rare_reports(
+            region_code, selected, session=session, per_species=per_species,
+            include_exif=include_exif and require_photo,
+        )
         return region_code, reports
     except (aiohttp.ClientError, asyncio.TimeoutError) as error:
         raise ChecklistError(f"Couldn't reach eBird ({error.__class__.__name__}).") from error
+    finally:
+        if owns_session:
+            await session.close()
+
+
+async def fetch_alert_reports(
+    region_code: str,
+    *,
+    days: int = 3,
+    limit: int = 25,
+    skip: set[str] | None = None,
+    session: aiohttp.ClientSession | None = None,
+) -> list[RareReport]:
+    """Every flagged report in the window — confirmed *and* awaiting review.
+
+    This is what the alert poller sends: one report per species per checklist,
+    newest first, with a photo attached where one exists. `skip` holds
+    `notable_key`s already delivered, filtered out before any per-report
+    lookups so a quiet poll costs a single request.
+    """
+    owns_session = session is None
+    if owns_session:
+        session = aiohttp.ClientSession()
+    try:
+        observations = await fetch_notable(region_code, days=days, session=session)
+        per_species = Counter(o.get("speciesCode") for o in observations)
+        fresh: dict[str, dict] = {}
+        for obs in sorted(observations, key=lambda o: o.get("obsDt") or "", reverse=True):
+            key = notable_key(obs)
+            if notable_status(obs) == STATUS_REJECTED or key in (skip or ()):
+                continue
+            fresh.setdefault(key, obs)
+        selected = await attach_photos(list(fresh.values())[:limit], session=session)
+        return await build_rare_reports(
+            region_code, selected, session=session, per_species=per_species
+        )
     finally:
         if owns_session:
             await session.close()
@@ -1160,6 +1348,26 @@ async def _main(argv: list[str]) -> int:
     flags, args = extract_flags(argv)
     verbose = VERBOSE_FLAG in flags
     compact_flag = pick_compact_flag(flags)
+    if args and args[0].lower() == "alert":
+        words = [t for t in args[1:] if not t.isdigit()]
+        nums = [int(t) for t in args[1:] if t.isdigit()]
+        if not words:
+            print("usage: python ebird_media.py alert <region> [days] [limit]", file=sys.stderr)
+            return 2
+        region_code = await resolve_region_code(" ".join(words))
+        reports = await fetch_alert_reports(
+            region_code,
+            days=nums[0] if nums else 3,
+            limit=nums[1] if len(nums) > 1 else 25,
+        )
+        print(f"{len(reports)} alertable report(s) in {region_code}")
+        for report in reports:
+            mark = "✅" if report.confirmed else "⏳"
+            photo = f" ML{report.details.photo.asset_id}" if report.details else ""
+            print(f"  {report.obs_dt}  {mark} {report.rarity_emoji} "
+                  f"{report.common_name:<26} {report.rarity_display}{photo}")
+            print(f"      {report.location} · {report.observer} · {report.checklist_url}")
+        return 0
     if args and args[0].lower() == "rare":
         rest = args[1:]
         text_mode = any(t.lower() in ("text", "nophoto") for t in rest)
