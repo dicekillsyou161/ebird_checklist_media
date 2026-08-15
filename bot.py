@@ -1,17 +1,28 @@
 """Discord bot: /checklist <eBird checklist> posts every public Macaulay Library photo."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
+from collections import Counter
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+import aiohttp
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
 
+from alerts import (
+    CONFIRMATION,
+    RARITY_LEVELS,
+    AlertStore,
+    Subscription,
+)
 from ebird_media import (
     COMPACT_FLAG,
+    STATUS_REJECTED,
     VERBOSE_FLAG,
     AssetDetails,
     ChecklistError,
@@ -20,14 +31,21 @@ from ebird_media import (
     SORT_OBS,
     SORT_RECENT,
     RareReport,
+    attach_photos,
+    build_rare_reports,
     extract_flags,
     fetch_asset_details,
     fetch_checklist_photos,
+    fetch_notable,
     fetch_rare_reports,
     fetch_user_details,
+    notable_key,
+    notable_status,
     parse_asset_id,
     parse_checklist_id,
     pick_compact_flag,
+    region_name,
+    resolve_region_code,
     select_fields,
 )
 
@@ -36,6 +54,35 @@ load_dotenv()
 MAX_PHOTOS_POSTED = 50  # keep one command from flooding a channel
 FIELD_VALUE_MAX = 300            # display cap for one metadata value (Discord allows 1024)
 EMBED_COLOR = discord.Color.from_str("#4a7628")  # eBird green
+
+
+def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name, "")
+    try:
+        return max(minimum, min(int(raw), maximum)) if raw else default
+    except ValueError:
+        print(f"{name}={raw!r} isn't a number — using {default}.")
+        return default
+
+
+# Rare bird alerts: poll every watched region on this cadence and DM what's new.
+ALERT_INTERVAL_SECONDS = _env_int("ALERT_INTERVAL_SECONDS", 300, 60, 3600)
+# eBird's window is by *observation* date, so it has to be wider than the poll
+# interval: checklists are often submitted hours or days after the sighting.
+ALERT_WINDOW_DAYS = _env_int("ALERT_WINDOW_DAYS", 3, 1, 30)
+ALERT_BUILD_MAX = 40   # most reports to look up per region per poll
+ALERT_DM_MAX = 10      # most DMs to one subscriber per poll
+ALERT_FAILURE_LIMIT = 3  # consecutive DM failures before a subscription pauses
+SUBSCRIPTIONS_PATH = Path(__file__).resolve().parent / "subscriptions.json"
+
+store = AlertStore(SUBSCRIPTIONS_PATH)
+
+RARITY_COLORS = {  # match the tier emoji so an alert reads at a glance
+    "Mega rarity": discord.Color.from_str("#c62828"),
+    "Very rare": discord.Color.from_str("#ef6c00"),
+    "Rare": discord.Color.from_str("#f9a825"),
+    "Scarce": discord.Color.from_str("#2e7d32"),
+}
 
 
 # Learned identities: Discord links (via /iam) and display names seen in any
@@ -119,8 +166,10 @@ class ChecklistBot(discord.Client):
     def __init__(self) -> None:
         super().__init__(intents=discord.Intents.default())
         self.tree = app_commands.CommandTree(self)
+        self.alert_task: asyncio.Task | None = None
 
     async def setup_hook(self) -> None:
+        self.alert_task = self.loop.create_task(alert_loop(), name="rare-bird-alerts")
         raw = os.getenv("GUILD_ID", "")
         tokens = [token for token in re.split(r"[,\s]+", raw) if token]
         if not all(token.isdigit() for token in tokens):
@@ -148,7 +197,13 @@ bot = ChecklistBot()
 
 @bot.event
 async def on_ready() -> None:
-    print(f"Logged in as {bot.user} — /checklist is ready")
+    watching = len(store.active())
+    alerts = (
+        f"{watching} rare bird alert subscription(s), polled every "
+        f"{ALERT_INTERVAL_SECONDS // 60} min"
+        if watching else "no rare bird alert subscriptions yet"
+    )
+    print(f"Logged in as {bot.user} — /checklist is ready; {alerts}")
 
 
 def build_embed(
@@ -466,7 +521,7 @@ def build_rare_embed(report: RareReport, compact_flag: str | None) -> discord.Em
         embed.add_field(name="Location", value=report.location[:1024], inline=True)
     if report.observer:
         embed.add_field(name="Observer", value=report.observer[:1024], inline=True)
-    embed.add_field(name="Status", value="✅ Reviewed & accepted", inline=True)
+    embed.add_field(name="Status", value=report.status_display, inline=True)
     if report.reports_in_window > 1:
         embed.add_field(
             name="Other reports", value=f"{report.reports_in_window} in the window", inline=True
@@ -554,6 +609,298 @@ async def iam_command(interaction: discord.Interaction, user: str) -> None:
         f"Linked! You are **{result.display_name}** (`{result.user_id}`) — your @mention "
         "and display name now work in /top, /recent, and /sp."
     )
+
+
+def build_alert_embed(
+    report: RareReport, subscription: Subscription, kind: str
+) -> discord.Embed:
+    """One rare-bird alert, sized for a DM."""
+    confirming = kind == CONFIRMATION
+    lines = []
+    if report.sci_name:
+        lines.append(f"*{report.sci_name}*")
+    lines.append(report.rarity_display)
+    if confirming:
+        lines.append("eBird has now reviewed and accepted this record.")
+    embed = discord.Embed(
+        title=("✅ Confirmed: " if confirming else f"{report.rarity_emoji} ") + report.common_name,
+        url=report.checklist_url,
+        description="\n".join(lines),
+        color=RARITY_COLORS.get(report.rarity_label, EMBED_COLOR),
+    )
+    embed.add_field(name="Status", value=report.status_display, inline=True)
+    if report.obs_dt:
+        embed.add_field(name="Observed", value=report.obs_dt, inline=True)
+    if report.how_many:
+        embed.add_field(name="Count", value=str(report.how_many), inline=True)
+    if report.location:
+        place = f"[{report.location}]({report.map_url})" if report.map_url else report.location
+        embed.add_field(name="Location", value=place[:1024], inline=False)
+    if report.observer:
+        embed.add_field(name="Observer", value=report.observer[:1024], inline=True)
+    embed.add_field(
+        name="Checklist",
+        value=f"[{report.checklist_id}]({report.checklist_url})",
+        inline=True,
+    )
+    if report.details:
+        photo = report.details.photo
+        embed.set_image(url=photo.image_url(1200))
+        embed.add_field(
+            name="Photo",
+            value=f"[ML{photo.asset_id}]({photo.asset_url}) © {photo.photographer}",
+            inline=False,
+        )
+    embed.set_footer(
+        text=f"{subscription.display_region} · {subscription.rarity_label} · /unalert to stop"
+    )
+    return embed
+
+
+async def deliver_alert(subscription: Subscription, embed: discord.Embed) -> bool:
+    """DM one alert; False when Discord wouldn't take it."""
+    try:
+        user = bot.get_user(int(subscription.user_id))
+        if user is None:
+            user = await bot.fetch_user(int(subscription.user_id))
+        await user.send(embed=embed)
+        return True
+    except (discord.Forbidden, discord.NotFound):
+        return False  # DMs closed, or the account is gone
+    except (discord.HTTPException, ValueError, AttributeError) as error:
+        print(f"Alert DM to {subscription.user_id} failed: {error!r}")
+        return False
+
+
+async def poll_region(
+    region: str, subscriptions: list[Subscription], session: aiohttp.ClientSession
+) -> bool:
+    """Alert every subscriber of this region about what they haven't seen. True if state changed."""
+    observations = await fetch_notable(region, days=ALERT_WINDOW_DAYS, session=session)
+    per_species = Counter(obs.get("speciesCode") for obs in observations)
+
+    # one entry per (checklist, species), keeping the latest review state
+    latest: dict[str, dict] = {}
+    for obs in observations:
+        if notable_status(obs) == STATUS_REJECTED:
+            continue  # a record reviewers threw out is not an alert
+        key = notable_key(obs)
+        prior = latest.get(key)
+        if prior is None or (obs.get("obsDt") or "") > (prior.get("obsDt") or ""):
+            latest[key] = obs
+
+    # only build reports somebody is actually owed: rarity and photo lookups cost requests
+    owed = [
+        obs for key, obs in latest.items()
+        if any(sub.pending_kind(key, notable_status(obs)) for sub in subscriptions)
+    ]
+    if not owed:
+        return False
+    owed.sort(key=lambda obs: obs.get("obsDt") or "", reverse=True)
+    pairs = await attach_photos(owed[:ALERT_BUILD_MAX], session=session)
+    reports = await build_rare_reports(
+        region, pairs, session=session, per_species=per_species
+    )
+    reports.sort(key=lambda report: report.obs_dt)  # DM oldest first, so DMs read in order
+
+    changed = False
+    for subscription in subscriptions:
+        sent = 0
+        for report in reports:
+            key = f"{report.checklist_id}:{report.species_code}"
+            kind = subscription.pending_kind(key, report.status)
+            if kind is None:
+                continue
+            if not subscription.wants_rarity(report.rarity_label):
+                # record it anyway, or every poll would rebuild the same report
+                subscription.mark_seen(key, report.obs_dt, report.status)
+                changed = True
+                continue
+            if sent >= ALERT_DM_MAX:
+                break
+            if await deliver_alert(subscription, build_alert_embed(report, subscription, kind)):
+                subscription.mark_seen(key, report.obs_dt, report.status)
+                subscription.alerts_sent += 1
+                subscription.last_alert = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                subscription.failures = 0
+                sent += 1
+            else:
+                subscription.failures += 1
+                if subscription.failures >= ALERT_FAILURE_LIMIT:
+                    subscription.paused = True
+                    print(
+                        f"Pausing alerts for {subscription.user_id} in {subscription.region}: "
+                        f"{subscription.failures} DM failures in a row."
+                    )
+                changed = True
+                break  # stop hammering a mailbox that is not accepting DMs
+            changed = True
+    return changed
+
+
+async def run_alert_poll() -> None:
+    """One sweep over every watched region."""
+    regions = store.regions()
+    if not regions:
+        return
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=ALERT_WINDOW_DAYS + 1)
+    ).strftime("%Y-%m-%d %H:%M")
+    changed = False
+    async with aiohttp.ClientSession() as session:
+        for region in regions:
+            watchers = [sub for sub in store.active() if sub.region == region]
+            if not watchers:
+                continue
+            try:
+                changed |= await poll_region(region, watchers, session)
+            except ChecklistError as error:
+                print(f"Alert poll for {region} failed: {error}")
+            except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+                print(f"Alert poll for {region} failed: {error!r}")
+    for subscription in store.subscriptions:
+        changed |= subscription.prune(cutoff)
+    if changed:
+        store.save()
+
+
+async def alert_loop() -> None:
+    """Poll for new rarities forever; one bad sweep must never kill the loop."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            await run_alert_poll()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - the loop outranks any single failure
+            print(f"Alert poll crashed: {error!r}")
+        await asyncio.sleep(ALERT_INTERVAL_SECONDS)
+
+
+@bot.tree.command(
+    name="alert",
+    description="DM me whenever a rare bird is reported in a region",
+)
+@app_commands.describe(
+    region="eBird region: a code (US-WA, US-WA-033) or a name (king county wa)",
+    rarity="Only alert at this tier or rarer (default: anything eBird flags)",
+    confirmations="Also DM when a report you were alerted to is later accepted by eBird",
+)
+@app_commands.choices(
+    rarity=[app_commands.Choice(name=label, value=level) for level, label in RARITY_LEVELS]
+)
+async def alert_command(
+    interaction: discord.Interaction,
+    region: str,
+    rarity: app_commands.Choice[int] | None = None,
+    confirmations: bool = False,
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+    try:
+        async with aiohttp.ClientSession() as session:
+            code = await resolve_region_code(region, session=session)
+            label = await region_name(code, session=session)
+            # seed with everything already in the window, so subscribing doesn't
+            # dump days of backlog into the user's DMs
+            backlog = await fetch_notable(code, days=ALERT_WINDOW_DAYS, session=session)
+    except ChecklistError as error:
+        await interaction.followup.send(str(error))
+        return
+
+    subscription = Subscription(
+        user_id=str(interaction.user.id),
+        region=code,
+        region_label=label,
+        min_rarity=rarity.value if rarity else 0,
+        confirmations=confirmations,
+        created=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    )
+    for obs in backlog:
+        subscription.mark_seen(notable_key(obs), obs.get("obsDt") or "", notable_status(obs))
+    store.add(subscription)
+    store.save()
+
+    minutes = ALERT_INTERVAL_SECONDS // 60
+    summary = (
+        f"Watching **{label}** (`{code}`) for you.\n"
+        f"Tier: {subscription.rarity_label} · checked every {minutes} min · "
+        f"confirmations: {'on' if confirmations else 'off'}\n"
+        f"{len(backlog)} report(s) already in the window were marked as seen, so you'll "
+        "only hear about new ones. Use `/alerts` to review or `/unalert` to stop."
+    )
+    greeting = discord.Embed(
+        title=f"🔔 Rare bird alerts on for {label}",
+        description=(
+            f"You'll get a DM like this when a new rarity is reported.\n"
+            f"Tier: {subscription.rarity_label}"
+        ),
+        color=EMBED_COLOR,
+    )
+    if not await deliver_alert(subscription, greeting):
+        summary += (
+            "\n\n⚠️ I couldn't DM you. Enable **Settings → Privacy & Safety → "
+            "Direct Messages** for this server, or alerts will pause after "
+            f"{ALERT_FAILURE_LIMIT} failures."
+        )
+    await interaction.followup.send(summary)
+
+
+@bot.tree.command(name="alerts", description="Show your rare bird alert subscriptions")
+async def alerts_command(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
+    mine = store.for_user(str(interaction.user.id))
+    if not mine:
+        await interaction.followup.send(
+            "No alert subscriptions yet. Start one with `/alert region:king county wa`."
+        )
+        return
+    lines = []
+    for subscription in sorted(mine, key=lambda s: s.region):
+        bits = [subscription.rarity_label, f"{subscription.alerts_sent} sent"]
+        if subscription.confirmations:
+            bits.append("confirmations on")
+        if subscription.paused:
+            bits.append("⚠️ paused (DMs failed; re-run `/alert` to resume)")
+        if subscription.last_alert:
+            bits.append(f"last {subscription.last_alert[:16].replace('T', ' ')}")
+        lines.append(
+            f"**{subscription.display_region}** (`{subscription.region}`)\n{' · '.join(bits)}"
+        )
+    embed = discord.Embed(
+        title="🔔 Your rare bird alerts",
+        description="\n\n".join(lines),
+        color=EMBED_COLOR,
+    )
+    embed.set_footer(text=f"Checked every {ALERT_INTERVAL_SECONDS // 60} min · /unalert to stop one")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="unalert", description="Stop rare bird alerts for a region")
+@app_commands.describe(region="Region to stop watching; leave empty to cancel all of them")
+async def unalert_command(interaction: discord.Interaction, region: str = "") -> None:
+    await interaction.response.defer(ephemeral=True)
+    user_id = str(interaction.user.id)
+    if not region.strip():
+        removed = store.remove_all(user_id)
+        store.save()
+        await interaction.followup.send(
+            f"Cancelled {removed} alert subscription(s)." if removed
+            else "You had no alert subscriptions."
+        )
+        return
+    try:
+        code = await resolve_region_code(region)
+    except ChecklistError as error:
+        await interaction.followup.send(str(error))
+        return
+    dropped = store.remove(user_id, code)
+    store.save()
+    if dropped is None:
+        await interaction.followup.send(
+            f"You weren't watching `{code}`. Use `/alerts` to see your subscriptions."
+        )
+        return
+    await interaction.followup.send(f"Stopped alerts for **{dropped.display_region}** (`{code}`).")
 
 
 def main() -> None:
