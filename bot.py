@@ -14,6 +14,7 @@ import discord
 from discord import app_commands
 from dotenv import load_dotenv
 
+import db
 from alerts import (
     CONFIRMATION,
     RARITY_LEVELS,
@@ -134,9 +135,13 @@ ALERT_WINDOW_DAYS = _env_int("ALERT_WINDOW_DAYS", 3, 1, 30)
 ALERT_BUILD_MAX = 40   # most reports to look up per region per poll
 ALERT_DM_MAX = 10      # most DMs to one subscriber per poll
 ALERT_FAILURE_LIMIT = 3  # consecutive DM failures before a subscription pauses
-SUBSCRIPTIONS_PATH = Path(__file__).resolve().parent / "subscriptions.json"
 
-store = AlertStore(SUBSCRIPTIONS_PATH)
+# Everything the bot remembers lives in one SQLite file. Old JSON state files
+# are imported on first start and renamed *.migrated (see db.py).
+HERE = Path(__file__).resolve().parent
+DB = db.connect(HERE / "bot.db")
+
+store = AlertStore(DB, legacy_json=HERE / "subscriptions.json")
 
 RARITY_COLORS = {  # match the tier emoji so an alert reads at a glance
     "Mega rarity": discord.Color.from_str("#c62828"),
@@ -148,49 +153,83 @@ RARITY_COLORS = {  # match the tier emoji so an alert reads at a glance
 
 # Learned identities: Discord links (via /iam) and display names seen in any
 # command's results, so "@mention" and "Mark Zorthesosen" work as user refs.
-REGISTRY_PATH = Path(__file__).resolve().parent / "aliases.json"
 _MENTION_RE = re.compile(r"<@!?(\d+)>")
 _NAMELIKE_RE = re.compile(r"^@?[^\d:/]+$")  # words only: no digits, no URLs
 
 
-def _load_registry() -> dict:
+def _migrate_aliases() -> None:
+    """One-time import of an aliases.json from before the database."""
+    legacy = HERE / "aliases.json"
     try:
-        data = json.loads(REGISTRY_PATH.read_text(encoding="utf-8"))
-        return {"discord": dict(data.get("discord", {})), "names": dict(data.get("names", {}))}
-    except (OSError, ValueError):
-        return {"discord": {}, "names": {}}
-
-
-_registry = _load_registry()
-
-
-def _save_registry() -> None:
-    try:
-        REGISTRY_PATH.write_text(
-            json.dumps(_registry, indent=2, sort_keys=True), encoding="utf-8"
+        data = json.loads(legacy.read_text(encoding="utf-8"))
+    except OSError:
+        return  # no legacy file: nothing to migrate
+    except ValueError as error:
+        print(f"Ignoring unreadable {legacy.name}: {error}")
+        return
+    links = [
+        (str(key), str(value))
+        for key, value in (data.get("discord") or {}).items() if value
+    ]
+    names = [
+        (str(key), str(entry[0]), str(entry[1]))
+        for key, entry in (data.get("names") or {}).items()
+        if isinstance(entry, (list, tuple)) and len(entry) == 2
+    ]
+    with DB:
+        DB.executemany(
+            "INSERT OR IGNORE INTO discord_links (discord_id, ebird_id) VALUES (?, ?)",
+            links,
         )
+        DB.executemany(
+            "INSERT OR IGNORE INTO names (key, ebird_id, display) VALUES (?, ?, ?)",
+            names,
+        )
+    try:
+        legacy.replace(legacy.with_name(legacy.name + ".migrated"))
+        print(f"Imported {len(links)} link(s) and {len(names)} name(s) from {legacy.name}.")
     except OSError as error:
-        print(f"Couldn't save {REGISTRY_PATH.name}: {error}")
+        print(f"Imported {legacy.name} but couldn't rename it afterwards: {error}")
+
+
+_migrate_aliases()
 
 
 def learn_names(pairs) -> None:
     """Remember (display name, USER… ID) pairs seen in results."""
-    changed = False
+    rows = []
     for display, user_id in pairs:
         display = (display or "").strip()
         if not display or not user_id or display == user_id:
             continue
-        key = display.lower()
-        if _registry["names"].get(key, [None])[0] != user_id:
-            _registry["names"][key] = [user_id, display]
-            changed = True
-    if changed:
-        _save_registry()
+        rows.append((display.lower(), user_id, display))
+    if rows:
+        with DB:
+            DB.executemany(
+                "INSERT INTO names (key, ebird_id, display) VALUES (?, ?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET"
+                " ebird_id = excluded.ebird_id, display = excluded.display",
+                rows,
+            )
+
+
+def link_discord(discord_id: str, ebird_id: str) -> None:
+    """Remember which eBird account a Discord user is (/iam)."""
+    with DB:
+        DB.execute(
+            "INSERT INTO discord_links (discord_id, ebird_id) VALUES (?, ?)"
+            " ON CONFLICT(discord_id) DO UPDATE SET ebird_id = excluded.ebird_id",
+            (discord_id, ebird_id),
+        )
 
 
 def linked_user(interaction: discord.Interaction) -> str:
     """The eBird ID this Discord account linked with /iam, or "" if none."""
-    return _registry["discord"].get(str(interaction.user.id), "")
+    row = DB.execute(
+        "SELECT ebird_id FROM discord_links WHERE discord_id = ?",
+        (str(interaction.user.id),),
+    ).fetchone()
+    return row["ebird_id"] if row else ""
 
 
 NO_USER_LINKED = (
@@ -209,9 +248,12 @@ def resolve_alias(text: str) -> str | None:
     stripped = text.strip()
     mention = _MENTION_RE.fullmatch(stripped)
     if mention:
-        linked = _registry["discord"].get(mention.group(1))
-        if linked:
-            return linked
+        row = DB.execute(
+            "SELECT ebird_id FROM discord_links WHERE discord_id = ?",
+            (mention.group(1),),
+        ).fetchone()
+        if row:
+            return row["ebird_id"]
         raise ChecklistError(
             "That Discord account isn't linked to an eBird user yet — "
             "they can link it with `/iam` (USER… ID or one of their ML asset links)."
@@ -219,10 +261,14 @@ def resolve_alias(text: str) -> str | None:
     if not _NAMELIKE_RE.fullmatch(stripped):
         return None
     needle = stripped.lstrip("@").strip().lower()
-    names = _registry["names"]
-    if needle in names:
-        return names[needle][0]
-    hits = {tuple(entry) for key, entry in names.items() if needle in key}
+    exact = DB.execute("SELECT ebird_id FROM names WHERE key = ?", (needle,)).fetchone()
+    if exact:
+        return exact["ebird_id"]
+    hits = {
+        (row["ebird_id"], row["display"])
+        for row in DB.execute("SELECT key, ebird_id, display FROM names")
+        if needle in row["key"]
+    }
     if len(hits) == 1:
         return next(iter(hits))[0]
     if hits:
@@ -879,8 +925,7 @@ async def iam_command(interaction: discord.Interaction, user: str) -> None:
     except ChecklistError as error:
         await interaction.followup.send(str(error), ephemeral=True)
         return
-    _registry["discord"][str(interaction.user.id)] = result.user_id
-    _save_registry()
+    link_discord(str(interaction.user.id), result.user_id)
     learn_names([(result.display_name, result.user_id)])
     await interaction.followup.send(
         f"Linked! You are **{result.display_name}** (`{result.user_id}`). You can now "
