@@ -800,8 +800,11 @@ def build_rare_digest(region_code: str, days: int, reports: list[RareReport]) ->
     """Every report condensed into one embed, no photos."""
     entries: list[str] = []
     used = 0
+    county_region = region_code.count("-") >= 2  # every line would repeat it
     for report in reports:
         location = report.location if len(report.location) <= 44 else report.location[:43] + "…"
+        if report.county and not county_region:
+            location = f"{location} ({report.county})" if location else report.county
         observer = report.observer if len(report.observer) <= 24 else report.observer[:23] + "…"
         context = " · ".join(bit for bit in (report.obs_dt, location, observer) if bit)
         camera = " 📷" if report.details else ""
