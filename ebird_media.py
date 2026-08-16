@@ -1262,14 +1262,17 @@ async def fetch_rare_reports(
     unique_species: bool = True,
     include_exif: bool = False,
     require_photo: bool = True,
+    confirmed_only: bool = False,
     session: aiohttp.ClientSession | None = None,
 ) -> tuple[str, list[RareReport]]:
-    """Recent eBird-confirmed rarities in a region, most recent first.
+    """Recent rarities in a region, most recent first.
 
-    Only observations a reviewer has accepted (`obsValid`) are returned. By
-    default each must also have a retrievable public photo; with
-    `require_photo=False` every confirmed report is listed, and `details`
-    holds a photo only for those that actually have one.
+    Both reviewer-accepted and still-unreviewed observations are returned
+    (each report carries its `status`); records a reviewer rejected never
+    are. `confirmed_only=True` keeps only accepted ones. By default each
+    report must also have a retrievable public photo; with
+    `require_photo=False` every report is listed, and `details` holds a
+    photo only for those that actually have one.
     """
     owns_session = session is None
     if owns_session:
@@ -1280,9 +1283,13 @@ async def fetch_rare_reports(
         per_species = Counter(o.get("speciesCode") for o in observations)
         # "confirmed" = a regional reviewer accepted the record; hasRichMedia
         # is eBird's own flag that something was attached (photo, audio or video)
+        wanted = (
+            (lambda o: bool(o.get("obsValid"))) if confirmed_only
+            else (lambda o: notable_status(o) != STATUS_REJECTED)
+        )
         candidates = [
             o for o in observations
-            if o.get("obsValid") and (o.get("hasRichMedia") or not require_photo)
+            if wanted(o) and (o.get("hasRichMedia") or not require_photo)
         ]
         ordered: list[dict] = []
         seen_reports: set[tuple] = set()
@@ -1395,20 +1402,27 @@ async def _main(argv: list[str]) -> int:
         return 0
     if args and args[0].lower() == "rare":
         rest = args[1:]
-        text_mode = any(t.lower() in ("text", "nophoto") for t in rest)
-        words = [t for t in rest if not t.isdigit() and t.lower() not in ("text", "nophoto")]
+        tokens = ("photos", "confirmed", "text", "nophoto")  # last two: old defaults, now no-ops
+        photo_mode = any(t.lower() == "photos" for t in rest)
+        confirmed_mode = any(t.lower() == "confirmed" for t in rest)
+        words = [t for t in rest if not t.isdigit() and t.lower() not in tokens]
         nums = [int(t) for t in rest if t.isdigit()]
         if not words:
-            print("usage: python ebird_media.py rare <region> [count] [days] [text]", file=sys.stderr)
+            print(
+                "usage: python ebird_media.py rare <region> [count] [days] [photos] [confirmed]",
+                file=sys.stderr,
+            )
             return 2
         region_code, reports = await fetch_rare_reports(
             " ".join(words),
             count=nums[0] if nums else 10,
             days=nums[1] if len(nums) > 1 else 14,
-            require_photo=not text_mode,
+            require_photo=photo_mode,
+            confirmed_only=confirmed_mode,
         )
-        qualifier = "" if text_mode else " with photos"
-        print(f"{len(reports)} eBird-confirmed rarities{qualifier} in {region_code}")
+        kind = "eBird-confirmed rarities" if confirmed_mode else "rarities"
+        qualifier = " with photos" if photo_mode else ""
+        print(f"{len(reports)} {kind}{qualifier} in {region_code}")
         for report in reports:
             print(f"  {report.obs_dt}  {report.rarity_emoji} {report.common_name:<26} "
                   f"{report.rarity_display}")
