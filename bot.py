@@ -391,8 +391,8 @@ class Delivery:
     def private_reply(self) -> bool:
         return self.interaction.guild is not None
 
-    async def send(self, **kwargs) -> None:
-        """One message of results."""
+    async def send(self, **kwargs) -> discord.Message:
+        """One message of results; returns it so callers can edit it later."""
         if self.mode == "dm":
             try:
                 if self._channel is None:
@@ -400,8 +400,7 @@ class Delivery:
                         self.interaction.user.dm_channel
                         or await self.interaction.user.create_dm()
                     )
-                await self._channel.send(**kwargs)
-                return
+                return await self._channel.send(**kwargs)
             except (discord.Forbidden, discord.HTTPException):
                 self.mode = "ephemeral"  # deliver the rest here instead
                 await self.notice(
@@ -409,7 +408,9 @@ class Delivery:
                     "Settings → Privacy & Safety → Direct Messages from server members "
                     "to get results in your DMs, where they stay and can be forwarded."
                 )
-        await self.interaction.followup.send(ephemeral=self.mode == "ephemeral", **kwargs)
+        return await self.interaction.followup.send(
+            ephemeral=self.mode == "ephemeral", **kwargs
+        )
 
     async def notice(self, text: str) -> None:
         """A short reply to whoever ran the command, never to the channel."""
@@ -694,10 +695,23 @@ async def _send_user_photos(
     if result.display_name:
         bits.append(result.display_name)
     bits.append(f"[full gallery](<{catalog}>)")
-    await delivery.send(content=" · ".join(bits))
-    for details in result.details:
-        await delivery.send(embed=build_asset_embed(details, compact_flag))
-    await delivery.finish(f"Sent {len(result.details)} item(s) to your DMs.")
+    pages = [build_asset_embed(details, compact_flag) for details in result.details]
+    for number, embed in enumerate(pages, start=1):
+        if len(pages) > 1:
+            footer = embed.footer.text or ""
+            page = f"{number}/{len(pages)}"
+            embed.set_footer(text=f"{footer} · {page}" if footer else page)
+    if len(pages) == 1:
+        await delivery.send(content=" · ".join(bits), embed=pages[0])
+        await delivery.finish("Sent 1 item to your DMs.")
+        return
+    pager = EmbedPager(pages, interaction.user.id)
+    pager.message = await delivery.send(
+        content=" · ".join(bits), embed=pages[0], view=pager
+    )
+    await delivery.finish(
+        f"Sent {len(pages)} item(s) to your DMs as one paged message."
+    )
 
 
 @bot.tree.command(
@@ -794,13 +808,15 @@ async def recent_command(
 
 
 DIGEST_BUDGET = 3900  # leave room under Discord's 4096-char description limit
+MAX_RARE_PHOTO_POSTS = 25  # photo mode is one message per report; digests page instead
 
 
-def build_rare_digest(region_code: str, days: int, reports: list[RareReport]) -> discord.Embed:
-    """Every report condensed into one embed, no photos."""
-    entries: list[str] = []
-    used = 0
+def build_rare_digest(
+    region_code: str, days: int, reports: list[RareReport]
+) -> list[discord.Embed]:
+    """The reports condensed into text pages, each within Discord's embed cap."""
     county_region = region_code.count("-") >= 2  # every line would repeat it
+    entries: list[str] = []
     for report in reports:
         location = report.location if len(report.location) <= 44 else report.location[:43] + "…"
         if report.county and not county_region:
@@ -809,32 +825,92 @@ def build_rare_digest(region_code: str, days: int, reports: list[RareReport]) ->
         context = " · ".join(bit for bit in (report.obs_dt, location, observer) if bit)
         camera = " 📷" if report.details else ""
         pending = " ⚠️" if report.status == STATUS_PENDING else ""
-        entry = (
+        entries.append(
             f"{report.rarity_emoji} **{report.common_name}**{pending}{camera}"
             f" · {report.rarity_label}\n"
             f"{context} · [checklist]({report.checklist_url})"
         )
-        if used + len(entry) + 2 > DIGEST_BUDGET:
-            entries.append(f"…and {len(reports) - len(entries)} more")
-            break
-        entries.append(entry)
+
+    chunks: list[list[str]] = [[]]
+    used = 0
+    for entry in entries:
+        if chunks[-1] and used + len(entry) + 2 > DIGEST_BUDGET:
+            chunks.append([])
+            used = 0
+        chunks[-1].append(entry)
         used += len(entry) + 2
-    embed = discord.Embed(
-        title=f"Rare birds in {region_code}",
-        description="\n\n".join(entries),
-        color=EMBED_COLOR,
-    )
+
     with_photos = sum(1 for report in reports if report.details)
     unconfirmed = sum(1 for report in reports if report.status == STATUS_PENDING)
-    bits = [
-        f"{len(reports)} report(s)",
-        f"last {days} days",
-        f"📷 = has a photo ({with_photos})",
-    ]
-    if unconfirmed:
-        bits.append(f"⚠️ = unconfirmed ({unconfirmed})")
-    embed.set_footer(text=" · ".join(bits))
-    return embed
+    pages: list[discord.Embed] = []
+    first = 1
+    for number, chunk in enumerate(chunks, start=1):
+        embed = discord.Embed(
+            title=f"Rare birds in {region_code}",
+            description="\n\n".join(chunk),
+            color=EMBED_COLOR,
+        )
+        bits = [
+            f"{len(reports)} report(s)",
+            f"last {days} days",
+            f"📷 = has a photo ({with_photos})",
+        ]
+        if unconfirmed:
+            bits.append(f"⚠️ = unconfirmed ({unconfirmed})")
+        if len(chunks) > 1:
+            bits.insert(0, f"Page {number}/{len(chunks)} · reports {first}–{first + len(chunk) - 1}")
+        embed.set_footer(text=" · ".join(bits))
+        first += len(chunk)
+        pages.append(embed)
+    return pages
+
+
+# Slightly under 15 minutes: an ephemeral digest is edited through the
+# interaction webhook, whose token expires then; quitting first means the
+# timeout edit that disables the buttons still goes through.
+PAGER_TIMEOUT = 840
+
+
+class EmbedPager(discord.ui.View):
+    """Back/Next buttons that page one message through a list of embeds."""
+
+    def __init__(self, pages: list[discord.Embed], owner_id: int) -> None:
+        super().__init__(timeout=PAGER_TIMEOUT)
+        self.pages = pages
+        self.owner_id = owner_id
+        self.index = 0
+        self.message: discord.Message | None = None
+        self._sync()
+
+    def _sync(self) -> None:
+        self.back.disabled = self.index == 0
+        self.forward.disabled = self.index == len(self.pages) - 1
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.owner_id
+
+    async def _show(self, interaction: discord.Interaction) -> None:
+        self._sync()
+        await interaction.response.edit_message(embed=self.pages[self.index], view=self)
+
+    @discord.ui.button(label="◀ Back", style=discord.ButtonStyle.secondary)
+    async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.index = max(self.index - 1, 0)
+        await self._show(interaction)
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.primary)
+    async def forward(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.index = min(self.index + 1, len(self.pages) - 1)
+        await self._show(interaction)
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass  # the message may be gone; nothing to clean up
 
 
 def build_rare_embed(report: RareReport, compact_flag: str | None) -> discord.Embed:
@@ -874,7 +950,7 @@ def build_rare_embed(report: RareReport, compact_flag: str | None) -> discord.Em
 )
 @app_commands.describe(
     region="eBird region — code (US-WA, US-WA-033) or name (king county wa)",
-    count="How many reports to post (1–25, default 10)",
+    count="How many reports (1–100, default 10; photos:True caps at 25)",
     days="How many days back to search (1–30, default 14)",
     repeats="Allow several reports of the same species (default: most recent of each)",
     confirmed="Only reports eBird reviewers have accepted (default: unconfirmed included)",
@@ -885,7 +961,7 @@ def build_rare_embed(report: RareReport, compact_flag: str | None) -> discord.Em
 async def rare_command(
     interaction: discord.Interaction,
     region: str,
-    count: app_commands.Range[int, 1, 25] = 10,
+    count: app_commands.Range[int, 1, 100] = 10,
     days: app_commands.Range[int, 1, 30] = 14,
     repeats: bool = False,
     confirmed: bool = False,
@@ -894,6 +970,8 @@ async def rare_command(
 ) -> None:
     delivery = await defer_privately(interaction)
     compact_flag = detail_flag(detail)
+    if photos:
+        count = min(count, MAX_RARE_PHOTO_POSTS)  # one message per report in photo mode
     try:
         region_code, reports = await fetch_rare_reports(
             region, count=count, days=days, unique_species=not repeats,
@@ -912,7 +990,12 @@ async def rare_command(
         return
 
     if not photos:
-        await delivery.send(embed=build_rare_digest(region_code, days, reports))
+        pages = build_rare_digest(region_code, days, reports)
+        if len(pages) == 1:
+            await delivery.send(embed=pages[0])
+        else:
+            pager = EmbedPager(pages, interaction.user.id)
+            pager.message = await delivery.send(embed=pages[0], view=pager)
         await delivery.finish(f"Sent the `{region_code}` rarity digest to your DMs.")
         return
 
