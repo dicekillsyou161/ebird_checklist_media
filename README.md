@@ -104,8 +104,9 @@ return candidates. Audio and video included (no image in the embed).
 ```
 
 Default output is one digest embed, newest first, confirmed and unconfirmed
-both included: a line per report with rarity, date, place, observer, and
-checklist link. ⚠️ = awaiting review, 📷 = verified public photo.
+both included: a line per report with rarity, date, place and county,
+observer, and checklist link (county omitted when the region searched is a
+county). ⚠️ = awaiting review, 📷 = verified public photo.
 
 - **Region forms**: eBird code (`US`, `US-WA`, `US-WA-033`), state or
   country name, state abbreviation (`WA`), or county + state
