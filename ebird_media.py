@@ -219,6 +219,7 @@ class RareReport:
     latitude: float | None = None
     longitude: float | None = None
     how_many: int | None = None    # birds reported, when the observer counted
+    county: str = ""               # subnational2Name, e.g. "King"
 
     @property
     def checklist_url(self) -> str:
@@ -1250,6 +1251,7 @@ async def build_rare_reports(
             latitude=obs.get("lat"),
             longitude=obs.get("lng"),
             how_many=obs.get("howMany"),
+            county=obs.get("subnational2Name") or "",
         ))
     return reports
 
