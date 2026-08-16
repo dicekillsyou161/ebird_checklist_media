@@ -1,6 +1,6 @@
 # eBird Checklist Photos Discord Bot
 
-One slash command: give it an eBird checklist link or ID, and it posts every
+/checklist: give it an eBird checklist link or ID, and it posts every
 public photo from that checklist as embeds; species name, the image itself,
 and a link to each photo's Macaulay Library page.
 
@@ -244,14 +244,15 @@ were only removed from the Discord commands, which use `detail` instead.
 
 ## Rare bird reports
 
-`/rare` posts recent **eBird-confirmed** rarities for a region that have
-public photos, newest first:
+`/rare` posts recent rarities for a region, newest first, as a single text
+digest; reviewer-accepted and still-unreviewed reports both appear:
 
 ```
 /rare region:US-WA
 /rare region:king county wa count:5 days:7
-/rare region:US-WA detail:Full  (the detail option works here too)
-/rare region:US-WA text:True    (one summary embed, photos not required)
+/rare region:US-WA confirmed:True   (only reviewer-accepted reports)
+/rare region:US-WA photos:True      (only reports with a photo, as photo embeds)
+/rare region:US-WA photos:True detail:Full  (the detail option applies to photo embeds)
 ```
 
 - **Region**: an eBird code (`US`, `US-WA`, `US-WA-033`), a state or country
@@ -261,22 +262,22 @@ public photos, newest first:
   isn't also a country code, so `WA` means Washington; use `AU-WA` for
   Western Australia. An ambiguous name (`king` on its own) comes back with
   candidates rather than a guess.
-- **Confirmed**: only observations a regional reviewer has accepted
-  (`obsValid`). Unreviewed reports of the same bird are skipped, so the list
-  lags a live rare-bird alert by however long review takes.
-- **With photos**: eBird's `hasRichMedia` flag is only a hint (it also covers
-  audio, and media can be unindexed), so the bot verifies an actual public
-  photo for each report and skips those without one.
+- **The digest** (the default) is one embed: a line per report with rarity,
+  date, place, observer, and a checklist link, but no images. A ⚠️ marks
+  reports still awaiting eBird review; a 📷 marks reports with a verified
+  public photo (not just eBird's `hasRichMedia` flag, which also covers audio
+  and unindexed media); open the checklist link to see it. Long lists are
+  trimmed with an "…and N more" line.
+- **`confirmed:True`** keeps only observations a regional reviewer has
+  accepted (`obsValid`). That list lags a live rare-bird alert by however
+  long review takes, so the default includes unreviewed reports too; records
+  reviewers *rejected* never appear either way.
+- **`photos:True`** keeps only reports with a verified public photo and posts
+  each as its own photo embed with metadata (this was the old default). The
+  `detail` option chooses how much metadata those embeds carry.
 - By default it shows the most recent report **per species**; set
   `repeats:True` to allow several reports of the same bird.
 - `days` searches 1–30 days back (eBird's own limit).
-- `text:True` drops the photo requirement and posts everything as a **single**
-  embed: one line per report with rarity, date, place, observer, and a
-  checklist link, but no images. It covers more ground, since photo-less
-  reports are included and recent finds show up sooner. A 📷 marks reports
-  that do have a photo (verified, not just eBird's `hasRichMedia` flag, which
-  also covers audio and unindexed media); open the checklist link to see it.
-  Long lists are trimmed with an "…and N more" line.
 
 ### Alert subscriptions (DMs)
 
