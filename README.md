@@ -22,7 +22,9 @@ Discord bot for eBird and Macaulay Library media.
 | `/alert`, `/alerts`, `/unalert`, `/iam` | dismissable replies only you can see |
 
 In a DM with the bot, results post in place. If your DMs are closed, the
-bot falls back to dismissable replies.
+bot falls back to dismissable replies. Multi-item results (`/top`,
+`/recent`, `/sp`, and `/rare` digests) arrive as one message that pages
+with ◀ ▶ buttons, active for 14 minutes.
 
 ## Photo lookups
 
@@ -103,10 +105,10 @@ return candidates. Audio and video included (no image in the embed).
 /rare region:US-WA photos:True      (only reports with a photo, as embeds)
 ```
 
-Default output is one digest embed, newest first, confirmed and unconfirmed
-both included: a line per report with rarity, date, place and county,
-observer, and checklist link (county omitted when the region searched is a
-county). ⚠️ = awaiting review, 📷 = verified public photo.
+Default output is one digest message, newest first, confirmed and
+unconfirmed both included: a line per report with rarity, date, place and
+county, observer, and checklist link (county omitted when the region
+searched is a county). ⚠️ = awaiting review, 📷 = verified public photo.
 
 - **Region forms**: eBird code (`US`, `US-WA`, `US-WA-033`), state or
   country name, state abbreviation (`WA`), or county + state
@@ -117,7 +119,8 @@ county). ⚠️ = awaiting review, 📷 = verified public photo.
 - **`photos:True`**: only reports with a verified photo, one embed each,
   metadata per `detail`.
 - **`repeats:True`**: allow several reports per species (default: most
-  recent of each). `days`: 1 to 30.
+  recent of each). `days`: 1 to 30. `count`: 1 to 100 (photo mode caps at
+  25), default 10.
 
 ### Alert subscriptions
 
