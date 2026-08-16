@@ -1,250 +1,114 @@
-# eBird Checklist Photos Discord Bot
+# eBird Discord Bot
 
-/checklist: give it an eBird checklist link or ID, and it posts every
-public photo from that checklist as embeds; species name, the image itself,
-and a link to each photo's Macaulay Library page.
+A Discord bot for eBird and Macaulay Library media: checklist photo
+galleries, asset lookups with camera EXIF, per-user photo rankings, species
+searches, regional rarity reports, and rare bird alerts by DM.
 
-```
-/checklist S378216909
-/checklist https://ebird.org/checklist/S378216909
-/checklist S378216909 detail:Minimal
-```
-
-Photos are grouped by species, one message per species. Discord renders
-embeds that share a link as a single card with a grid of images, so all of a
-species' photos ride on one card: the title links to the Macaulay Library
-asset page, the description repeats the link in copyable form, and the footer
-carries the ML catalog number, photographer credit, and the photo count.
-Only the first photo of each species contributes metadata; the rest add just
-their image, which keeps a 24-photo checklist to 10 messages instead of 24.
-
-A card holds at most four images (Discord's limit), so a species with more
-photos continues on further image-only cards. For the full metadata or the
-camera EXIF of any individual photo, pass its catalog number to
-`/checkmedia ML662698120`.
-
-There is also `/checkmedia` for a single Macaulay Library asset:
-
-```
-/checkmedia https://macaulaylibrary.org/asset/662698120
-/checkmedia ML662698120
-/checkmedia ML662698120 detail:Minimal
-```
-
-It posts that photo with *all* its metadata in one embed, plus a link back to
-the asset's checklist and the camera EXIF the Macaulay Library displays on
-the asset page: camera make/model, lens, focal length, exposure, aperture,
-ISO, flash, capture timestamp, and GPS coordinates (when the uploaded file
-carried them). Assets with stripped EXIF get a "none available"
-note; audio/video assets show metadata and a link but no image.
+| Command | Does |
+|---|---|
+| `/checklist` | every public photo on a checklist, one message per species |
+| `/checkmedia` | one Macaulay Library asset with full metadata and camera EXIF |
+| `/top` | a user's highest-rated photos |
+| `/recent` | a user's latest uploads |
+| `/sp` | media search by species, optionally per user or region |
+| `/rare` | recent rarity reports for a region |
+| `/alert` `/alerts` `/unalert` | rare bird alert DMs for a region |
+| `/iam` | link your Discord account to your eBird identity |
 
 ## Where results appear
-
-Only `/checkmedia` posts to the channel for everyone to see, which makes it
-the one to reach for when sharing a photo. Everything else keeps the channel
-clean:
 
 | Command | Output |
 |---|---|
 | `/checkmedia` | posted publicly in the channel |
-| `/checklist`, `/top`, `/recent`, `/sp`, `/rare` | DMed to whoever ran it, with a dismissable "sent to your DMs" note |
+| `/checklist`, `/top`, `/recent`, `/sp`, `/rare` | your DMs, with a dismissable "sent to your DMs" note |
 | `/alert`, `/alerts`, `/unalert`, `/iam` | dismissable replies only you can see |
 
-Results go to DMs rather than dismissable replies because dismissable
-(ephemeral) messages cannot be forwarded and vanish when the client reloads;
-DMs stay put and can be forwarded one by one. Run any of these commands
-*inside* a DM with the bot and the results simply post there in place. If
-your DMs are closed, the bot says so once and falls back to dismissable
-replies so nothing is lost.
+DMs are used because dismissable (ephemeral) replies can't be forwarded and
+vanish on reload. Run a command in a DM with the bot and results post there
+in place. If your DMs are closed, the bot says so once and falls back to
+dismissable replies.
+
+## Photo lookups
+
+```
+/checklist S378216909      (or the full checklist URL)
+/checkmedia ML662698120    (or the asset URL)
+```
+
+`/checklist` groups photos by species, one message each. Embeds that share a
+link render as one card with up to four images (Discord's limit); more
+photos continue on image-only cards. Metadata comes from each species' first
+photo only.
+
+`/checkmedia` posts one asset with all its metadata, a link to its
+checklist, and the camera EXIF from the asset page: camera, lens, focal
+length, exposure, aperture, ISO, flash, timestamp, and GPS when the file
+carried it. Audio and video assets show metadata and a link but no image.
 
 ## The `detail` option
 
-`/checklist`, `/checkmedia`, `/top`, `/recent`, `/sp`, and `/rare` all take
-the same optional `detail` option, picked from a dropdown. Every level keeps
-the photo, species (common + scientific name), the Macaulay Library link, the
-checklist link, and the current community rating; the levels differ in what
-else they add:
+`/checklist`, `/checkmedia`, `/top`, `/recent`, `/sp`, and `/rare` take the
+same optional `detail` dropdown. Every level keeps the photo, species names,
+Macaulay Library link, checklist link, and rating:
 
-| `detail` | Extra fields shown |
+| `detail` | Extra fields |
 |---|---|
 | **Brief** (default) | 📷 Focal length, Observed, Location |
 | **Camera** | 📷 Focal length, 📷 Exposure, 📷 Aperture, 📷 ISO, Observed, Location |
 | **Full** | everything the asset has, plus all camera EXIF |
 | **Minimal** | none |
 
-Leaving it unset gives Brief, so results stay readable; ask for **Full** when
-you want the whole record. On `/checklist` the camera rows have nothing to
-fill in, because per-photo EXIF would need one extra page fetch per asset, so
-Brief and Camera both show just Observed and Location there; use
-`/checkmedia ML…` for a single photo's camera data.
+On `/checklist` the camera rows stay empty (per-photo EXIF would cost one
+extra fetch per asset); use `/checkmedia` for a single photo's camera data.
 
-Finally, `/top` posts a user's highest-rated photos (Macaulay's
-"Best quality" ranking, `sort=rating_rank_desc`), one message per photo,
-with the same embeds and `detail` levels as `/checkmedia`. The optional
-`count` parameter picks how many (1–50, default 10):
+## User photo lists
 
 ```
 /top USER8940126
-/top ML662698120          (any asset by that person; resolves the photographer)
+/top ML662698120               (any asset link resolves its photographer)
 /top USER8940126 count:5 detail:Full
-/recent USER8940126       (same, but most recently uploaded instead of top rated)
-/recent USER8940126 obs:True   (sort by observation date/time instead of upload date)
-/sp species:black oystercatcher user:USER8940126   (one species, all media types)
-/sp species:horned puffin                          (no user: the global top-rated)
+/recent USER8940126            (latest uploads)
+/recent USER8940126 obs:True   (sort by observation date instead of upload)
 ```
 
-Omitting `user` on `/sp` returns the highest-rated media of that species
-across all of Macaulay Library. `group:True` works globally too: the bot
-resolves every taxon matching the name (up to 40; broader groups like
-"warbler" get a "too broad" reply), queries each one's global best, and
-merges the results. Cross-species ordering in that merge approximates
-Macaulay's quality rank (vote-count-weighted rating), so it can differ
-slightly from the catalog's exact order.
+`/top` uses Macaulay's "Best quality" ranking. `count` is 1 to 50, default
+10. A user can be named by:
 
-The optional `region` parameter takes an eBird region code (`US`, `US-WA`,
-`US-WA-033`) or a plain name ("washington"). It restricts *both* sides of
-the search: species-name matching considers only species recorded in that
-region (so "warbler" group-searches fine within a state), and the media
-results themselves are limited to that region:
+- **`USER…` ID** (the `userId=` in any photographer link on
+  media.ebird.org), bare digits, or one of their asset links. eBird profile
+  URLs don't work; those pages sit behind a sign-in.
+- **Display name** or unambiguous fragment (`zorthesosen`). The bot learns
+  names from every result it serves; until someone has looked a person up
+  by ID or asset link, the name is unknown and the bot says how to teach it.
+- **Discord @mention**, once that person has linked themselves with
+  `/iam <USER… ID or asset link>`.
 
-```
-/sp species:warbler region:US-WA group:True     (best warbler media from WA)
-/sp species:horned puffin region:washington     (WA's best Horned Puffins)
-```
+After `/iam`, `/top` and `/recent` with no `user` return your own photos.
+`/sp` with no user instead searches all of Macaulay Library.
 
-`/sp` matches the species by common *or* scientific name (fuzzy, via eBird's
-own taxonomy autocomplete) and, unlike the photo-only commands, includes
-audio and video assets too; those post with metadata and a link but no
-image. Results use the best-quality ranking.
-
-An exact name always wins ("yellow warbler" → that species). An ambiguous
-name ("warbler") isn't guessed: the bot replies with the closest matches so
-you can retry. To genuinely search a *group*, set `group:True`; the bot
-pages through the user's library (their best `MAX_PHOTOS`=400 items) and
-keeps everything whose common or scientific name contains your text:
+## Species search
 
 ```
-/sp species:warbler user:USER8940126 group:True   (all warblers they have)
+/sp species:horned puffin                        (global best)
+/sp species:black oystercatcher user:USER8940126
+/sp species:warbler user:USER8940126 group:True  (all their warblers)
+/sp species:warbler region:US-WA group:True      (best warbler media from WA)
 ```
 
-Identify the user by their `USER…` ID (click any photographer name on
-media.ebird.org; it's the `userId=` in the URL), bare digits, or one of
-their asset links. eBird *profile* URLs can't be used: those pages sit
-behind a sign-in.
+Matches common or scientific names through eBird's taxonomy (fuzzy). An
+exact name wins; an ambiguous one returns candidates instead of a guess.
+Audio and video are included (metadata and link, no image).
 
-Two friendlier forms also work everywhere a user is accepted:
-
-- **Display name** (`Mark Zorthesosen`, or any unambiguous fragment like
-  `zorthesosen`); there's no public eBird name-search API, so the bot
-  *learns* names from every command result it sees (kept in its database,
-  `bot.db`). Once anyone has pulled a person's media by ID or asset
-  link, their name resolves; before that, the bot replies telling you how to
-  teach it. Ambiguous fragments list the people they match.
-- **Discord @mention**; after a person links themselves once with
-  `/iam <their USER… ID or asset link>` (private/ephemeral reply), their
-  @mention works as a user reference.
-
-Linking with `/iam` also lets you drop the `user` option entirely on `/top`
-and `/recent` to get your own photos:
-
-```
-/iam ML662698120     (once)
-/top                 (your own top-rated photos)
-/recent count:5      (your own latest uploads)
-```
-
-Without a link, those commands reply with a note telling you to name someone
-or run `/iam`. `/sp` is deliberately different: leaving `user` blank there
-means a global search across all of Macaulay Library, not your own photos.
-
-## Setup
-
-**1. Create the Discord application**
-
-- Go to <https://discord.com/developers/applications> → **New Application**
-- **Bot** tab → **Reset Token** → copy the token (no privileged intents needed)
-
-**2. Invite the bot to your server**
-
-Replace `CLIENT_ID` with the Application ID from *General Information*:
-
-```
-https://discord.com/oauth2/authorize?client_id=CLIENT_ID&scope=bot+applications.commands&permissions=18432
-```
-
-(`18432` = Send Messages + Embed Links.)
-
-**3. Install and run**
-
-```sh
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-cp .env.example .env    # paste your DISCORD_TOKEN; optionally set GUILD_ID
-.venv/bin/python bot.py
-```
-
-Set `GUILD_ID` in `.env` (right-click the server → Copy Server ID, with
-Developer Mode on) to make the commands appear instantly in that server;
-comma-separate several IDs to register in multiple servers.
-
-The bot always registers its commands globally as well, which is what makes
-them work **in a DM with the bot**, not just in a server. Every command is
-available either way and behaves identically; none of them read server state.
-Global registration can take up to an hour to appear the first time, so a
-fresh bot works in your `GUILD_ID` server immediately but in DMs only once
-Discord has propagated it. Inside a `GUILD_ID` server the instant guild copy
-takes precedence over the global one, so you should not see duplicates; if
-you ever do, clear `GUILD_ID` and rely on the global registration alone.
-
-DM usage is a good fit for `/alert`, `/alerts`, and `/unalert`, since those
-reply privately and deliver to your DMs anyway.
-
-### Installing to your account (user install)
-
-The bot registers as **user-installable**, so the commands can travel with
-your Discord account instead of only living in servers the bot has joined:
-DMs, group DMs, and any server you're in. This needs one setting flipped in
-the Developer Portal, which the code cannot do for you:
-
-1. <https://discord.com/developers/applications> → your app → **Installation**
-2. Under **Installation Contexts**, tick **User Install** (keep Guild Install on)
-3. Under **Default Install Settings** → *User Install*, add the
-   `applications.commands` scope
-4. Restart the bot, then use the **Install Link** from that page (or the
-   app's profile → *Add App* → *Try it yourself*) to add it to your account
-
-If User Install isn't enabled in the portal, Discord rejects the sync; the
-bot notices, prints exactly what to change, and automatically falls back to
-guild install so servers and DMs keep working. Set `USER_INSTALL=false` in
-`.env` to skip user install entirely.
-
-The portal's **General Information** page also has *Terms of Service URL*
-and *Privacy Policy URL* fields; point them at
-[TERMS_OF_SERVICE.md](TERMS_OF_SERVICE.md) and
-[PRIVACY_POLICY.md](PRIVACY_POLICY.md) (for a GitHub repo, the rendered
-files' URLs work). Fill in the bracketed placeholders near the bottom of
-each file first (contact in both, governing law in the terms).
-
-One limit worth knowing: in a server where only *you* have installed the app
-(the bot itself isn't a member), Discord treats the app as a guest. Command
-replies are visible only to you there, which suits lookups like `/checkmedia`
-but means `/checklist` won't post a photo gallery the whole channel can see.
-Invite the bot to that server if you want shared output.
-
-## Test the fetcher without Discord
-
-```sh
-.venv/bin/python ebird_media.py S378216909
-.venv/bin/python ebird_media.py -vvv S378216909   # with per-photo metadata
-```
-
-Prints every public photo with its species and Macaulay Library link. The
-command-line tester keeps its own `-vvv`, `-c`, `-cc`, and `-ccc` flags; they
-were only removed from the Discord commands, which use `detail` instead.
+- **`group:True`** treats the text as a group name. With a user it filters
+  their library (best 400 items) for matching names; globally it queries
+  every matching taxon (up to 40; broader groups get a "too broad" reply)
+  and merges by approximate quality rank.
+- **`region`** (code or name) restricts both the name matching and the
+  results to that region.
 
 ## Rare bird reports
 
-`/rare` posts recent rarities for a region, newest first, as a single text
+`/rare` posts recent rarities for a region, newest first, as one text
 digest; reviewer-accepted and still-unreviewed reports both appear:
 
 ```
@@ -252,87 +116,63 @@ digest; reviewer-accepted and still-unreviewed reports both appear:
 /rare region:king county wa count:5 days:7
 /rare region:US-WA confirmed:True   (only reviewer-accepted reports)
 /rare region:US-WA photos:True      (only reports with a photo, as photo embeds)
-/rare region:US-WA photos:True detail:Full  (the detail option applies to photo embeds)
+/rare region:US-WA photos:True detail:Full
 ```
 
-- **Region**: an eBird code (`US`, `US-WA`, `US-WA-033`), a state or country
-  name, a bare state abbreviation (`WA`), or a county with its state in any
-  of these forms: `king county wa`, `king wa`, `King County, WA`,
-  `king county washington`. Two-letter input prefers the US state when it
-  isn't also a country code, so `WA` means Washington; use `AU-WA` for
-  Western Australia. An ambiguous name (`king` on its own) comes back with
-  candidates rather than a guess.
-- **The digest** (the default) is one embed: a line per report with rarity,
-  date, place, observer, and a checklist link, but no images. A ⚠️ marks
-  reports still awaiting eBird review; a 📷 marks reports with a verified
-  public photo (not just eBird's `hasRichMedia` flag, which also covers audio
-  and unindexed media); open the checklist link to see it. Long lists are
-  trimmed with an "…and N more" line.
-- **`confirmed:True`** keeps only observations a regional reviewer has
-  accepted (`obsValid`). That list lags a live rare-bird alert by however
-  long review takes, so the default includes unreviewed reports too; records
-  reviewers *rejected* never appear either way.
-- **`photos:True`** keeps only reports with a verified public photo and posts
-  each as its own photo embed with metadata (this was the old default). The
-  `detail` option chooses how much metadata those embeds carry.
-- By default it shows the most recent report **per species**; set
-  `repeats:True` to allow several reports of the same bird.
-- `days` searches 1–30 days back (eBird's own limit).
+- **Region forms**: an eBird code (`US`, `US-WA`, `US-WA-033`), a state or
+  country name, a bare state abbreviation (`WA`), or a county with its
+  state (`king county wa`, `king wa`, `King County, WA`). Two-letter input
+  prefers the US state when it isn't also a country code; use `AU-WA` for
+  Western Australia. Ambiguous names return candidates.
+- **The digest** is one embed, a line per report: rarity, date, place,
+  observer, checklist link. ⚠️ marks reports awaiting review; 📷 marks a
+  verified public photo (eBird's `hasRichMedia` flag alone is unreliable).
+  Long lists end with "…and N more".
+- **`confirmed:True`** keeps only reviewer-accepted (`obsValid`) records.
+  Rejected records never appear either way.
+- **`photos:True`** keeps only reports with a verified photo and posts each
+  as its own embed, with metadata per the `detail` option.
+- **`repeats:True`** allows several reports per species (default: most
+  recent of each). `days` searches 1 to 30 days back (eBird's limit).
 
-### Alert subscriptions (DMs)
+### Alert subscriptions
 
-`/alert` watches a region and DMs you when a new rare bird is reported there,
+`/alert` watches a region and DMs you when a new rare bird is reported,
 verified or not:
 
 ```
 /alert region:king county wa
 /alert region:US-WA rarity:🟠 Very rare or rarer
 /alert region:island county wa confirmations:True
-/alerts        (list your subscriptions, each with its 3 most recent reports)
-/unalert region:US-WA      (or /unalert with no region to cancel all)
+/alerts                    (your subscriptions, each with its 3 latest reports)
+/unalert region:US-WA      (no region: cancel all)
 ```
 
-- **Cadence**: every watched region is polled every 5 minutes
-  (`ALERT_INTERVAL_SECONDS`). Each poll reads eBird's notable feed for the
-  last 3 days (`ALERT_WINDOW_DAYS`); that window is deliberately wider than
-  the interval because the feed is ordered by *observation* date and
-  checklists are often submitted hours or days late. A report is identified
-  by checklist + species, so a wide window never re-sends anything.
-- **Verified and unverified both alert.** Records eBird reviewers have
-  *rejected* never do. Each DM states where review stands.
-- **`confirmations:True`** adds a second DM if a report you were alerted to
-  while it was pending is later accepted, titled "✅ Confirmed: …".
-- **`rarity`** sets a floor using the same tiers as `/rare`, so you can watch
-  a whole state for megas only and your county for anything.
-- **No backlog on subscribe**: everything already in the window is marked as
-  seen, so you only hear about what happens next. Re-subscribing to a region
-  you already watch updates the settings and keeps that history.
-- **`/alerts` shows recent activity**: under each subscription it lists the 3
-  most recent reports the bot has on record for that region (species, rarity
-  tier, review status, observation time, checklist link). This includes
-  reports below your rarity floor and the ones marked seen when you
-  subscribed, so a fresh subscription already shows what's current.
-- **Delivery**: alerts are DMs, so the bot must be able to message you; it
-  sends a confirmation DM when you subscribe and warns you in the reply if
-  that fails. After 3 consecutive failures a subscription pauses and `/alerts`
-  shows it as paused; re-run `/alert` to resume. At most 10 DMs per region per
-  poll, with the remainder carried to the next one.
-- **Shared polling**: a region is polled once per sweep no matter how many
-  people watch it, and the photo and rarity lookups behind those reports are
-  shared too, so eBird sees the same load whether one person or fifty watch
-  `US-WA-067`. Fetched feeds are also cached for two minutes and reused by
-  `/rare`, so a lookup right after a poll costs nothing. The poll itself
-  always reads fresh data, never the cache.
-- Subscriptions live in the bot's database (`bot.db`, see **Storage**),
-  written in single transactions and reloaded on restart, so a restart never
-  re-sends an alert or forgets a subscriber.
+- Polls every 5 minutes (`ALERT_INTERVAL_SECONDS`) over a 3-day window
+  (`ALERT_WINDOW_DAYS`); the window is wider than the interval because
+  checklists are often submitted late. Reports are keyed by checklist +
+  species, so nothing is ever re-sent.
+- Rejected records never alert. Each DM shows the review status.
+- **`confirmations:True`** adds a follow-up DM when a report you saw as
+  pending is later accepted.
+- **`rarity`** sets a floor using the `/rare` tiers.
+- Subscribing marks everything already in the window as seen (no backlog
+  dump). Re-subscribing updates settings and keeps history.
+- `/alerts` lists each subscription with its 3 most recent stored reports:
+  species, tier, status, time, checklist link.
+- After 3 failed DMs a subscription pauses; re-run `/alert` to resume. At
+  most 10 DMs per region per poll; the remainder carries over.
+- A region is polled once per sweep regardless of subscriber count; feeds
+  are cached 2 minutes and reused by `/rare`. The poll itself always
+  fetches fresh.
+- State lives in `bot.db` (see **Storage**); a restart never re-sends an
+  alert or forgets a subscriber.
 
-### How "level of rarity" is estimated
+### Rarity tiers
 
-eBird doesn't publish a rarity score, so the bot derives one: a species'
-share of all photos taken in that region **in earlier years**. Excluding the
-current year matters; a mega that fifty people just photographed would
-otherwise look common. The tiers:
+eBird publishes no rarity score, so the bot uses the species' share of the
+region's photos from earlier years (excluding the current year keeps a
+much-photographed mega from reading common):
 
 | Share of the region's prior photos | Label |
 |---|---|
@@ -342,100 +182,141 @@ otherwise look common. The tiers:
 | < 0.40% | 🟢 Scarce |
 | ≥ 0.40% | ⚪ Locally notable |
 
-The embed always shows the raw basis (e.g. "8 prior photos in US-WA"), so
-you can judge for yourself. County queries are scored at **state** scale, as
-a single county's counts are too small to rank reliably; the embed cites the
-state it used. Two caveats: it measures *photographic*
-documentation, not sightings, and most eBird-flagged records are ordinary
-species out of range or season; those land in the bottom tiers, which is
-the honest answer. Regions with fewer than 500 prior photos fall back to
-all-time counts.
+Embeds cite the basis ("8 prior photos in US-WA"). Counties are scored at
+state scale (county counts are too small to rank); regions with under 500
+prior photos fall back to all-time counts. The measure is photographic
+documentation, not sightings.
 
-## When the service won't start
+## Setup
 
-Run the preflight check on the box, as the service user; it reports the exact
-problem rather than leaving you to read a crash loop:
+1. Create the app at <https://discord.com/developers/applications>;
+   **Bot** tab → **Reset Token** → copy it (no privileged intents needed).
+2. Invite it, replacing `CLIENT_ID` with the Application ID from
+   *General Information* (`18432` = Send Messages + Embed Links):
+
+   ```
+   https://discord.com/oauth2/authorize?client_id=CLIENT_ID&scope=bot+applications.commands&permissions=18432
+   ```
+
+3. Install and run:
+
+   ```sh
+   python3 -m venv .venv
+   .venv/bin/pip install -r requirements.txt
+   cp .env.example .env    # paste your DISCORD_TOKEN; optionally set GUILD_ID
+   .venv/bin/python bot.py
+   ```
+
+`GUILD_ID` in `.env` (comma-separated server IDs) makes commands appear
+instantly in those servers. Commands also register globally, which is what
+makes them work in DMs; global registration can take up to an hour the
+first time. In a `GUILD_ID` server the guild copy takes precedence, so no
+duplicates appear.
+
+### User install
+
+The bot registers as user-installable, so commands can follow your account
+into DMs, group DMs, and any server you're in. One portal setting is
+required:
+
+1. <https://discord.com/developers/applications> → your app → **Installation**
+2. **Installation Contexts**: tick **User Install** (keep Guild Install on)
+3. **Default Install Settings** → *User Install*: add the
+   `applications.commands` scope
+4. Restart the bot, then add it to your account with that page's
+   **Install Link**
+
+If User Install isn't enabled in the portal, the bot logs the fix and falls
+back to guild install. `USER_INSTALL=false` in `.env` skips it entirely.
+
+In a server where only you have installed the app (the bot isn't a member),
+Discord treats it as a guest: replies are visible only to you, and
+`/checklist` can't post a gallery the channel can see. Invite the bot for
+shared output.
+
+The portal's **General Information** page has *Terms of Service URL* and
+*Privacy Policy URL* fields; point them at
+[TERMS_OF_SERVICE.md](TERMS_OF_SERVICE.md) and
+[PRIVACY_POLICY.md](PRIVACY_POLICY.md), after filling in each file's
+bracketed placeholders.
+
+## Command-line tester
+
+```sh
+.venv/bin/python ebird_media.py S378216909
+.venv/bin/python ebird_media.py -vvv S378216909            # per-photo metadata
+.venv/bin/python ebird_media.py rare US-WA 5 7             # rarity digest data
+.venv/bin/python ebird_media.py rare US-WA 5 7 photos confirmed
+```
+
+The CLI keeps the `-vvv`, `-c`, `-cc`, and `-ccc` flags that the Discord
+commands replaced with `detail`.
+
+## Troubleshooting
+
+If the service won't start, run the preflight check on the box as the
+service user; it names the exact problem instead of a crash loop:
 
 ```sh
 cd /opt/ebird-discord-bot && sudo -u ebird .venv/bin/python preflight.py
 ```
 
-It verifies the three modules are present and import cleanly (a common cause
-is copying one file but not the others), the dependency versions, that the
-directory is writable, and that `DISCORD_TOKEN` is readable. For the raw
-error, `journalctl -u ebird-discord-bot -n 40 --no-pager` shows the traceback.
-
-Command registration can no longer take the bot down: if a sync fails, it
-logs why and keeps running with whatever commands Discord already has.
+It verifies the project files are present and import cleanly (a common
+failure is copying one file but not the others), dependency versions,
+directory writability, and `DISCORD_TOKEN`. For the raw traceback:
+`journalctl -u ebird-discord-bot -n 40 --no-pager`. A failed command sync
+logs the reason and keeps running; it cannot take the bot down.
 
 ## Run as a systemd service
 
-The repo ships [ebird-discord-bot.service](ebird-discord-bot.service), written
-for a deployment at `/opt/ebird-discord-bot` running as the `ebird` user;
-edit the `WorkingDirectory`, `ExecStart`, and `User` lines to match your
-setup. `.env` is read from `WorkingDirectory`, so it must sit in the checkout
-alongside `bot.py`, readable by the service user (and ideally `chmod 600`).
-The service user also needs **write** access to that directory: the bot keeps
-its database (`bot.db`) there, so `chown -R ebird: /opt/ebird-discord-bot`
-after deploying.
-
-### Storage
-
-Everything the bot remembers (learned display names, `/iam` links, alert
-subscriptions and their delivery history) lives in one SQLite database,
-`bot.db`, beside `bot.py`. No extra software is needed (`sqlite3` is in
-Python's standard library). The file is created readable by the service user
-only, since it holds Discord user IDs and watch lists; writes are real
-transactions, so a crash can never truncate or half-update the state the way
-an interrupted JSON rewrite could.
-
-On the first start after upgrading, any old `aliases.json` and
-`subscriptions.json` are imported automatically and renamed `*.migrated`;
-keep or delete those copies as you like. The `bot.db-wal` and `bot.db-shm`
-files beside the database are part of normal SQLite operation. To back it
-up, either copy `bot.db` while the bot is stopped or run
-`sqlite3 bot.db ".backup bot-backup.db"` while it's running.
+[ebird-discord-bot.service](ebird-discord-bot.service) is written for
+`/opt/ebird-discord-bot` running as user `ebird`; edit `WorkingDirectory`,
+`ExecStart`, and `User` to match. `.env` is read from `WorkingDirectory`
+(readable by the service user, ideally `chmod 600`). The service user needs
+write access to the directory for `bot.db`:
+`chown -R ebird: /opt/ebird-discord-bot`.
 
 ```sh
-sudo useradd --system --shell /usr/sbin/nologin ebird   # once, if it doesn't exist
+sudo useradd --system --shell /usr/sbin/nologin ebird   # once
 sudo cp ebird-discord-bot.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now ebird-discord-bot
-journalctl -u ebird-discord-bot -f                          # follow logs
+journalctl -u ebird-discord-bot -f
 ```
 
-The unit restarts the bot on crashes (10 s delay) but backs off for 5 minutes
-after 5 rapid failures, so a missing or revoked token won't hot-loop.
-
-To run it as a *user* service instead (no root): remove the `User=` line,
-change `WantedBy=multi-user.target` to `default.target`, install the file to
+The unit restarts on crashes (10 s delay) and backs off for 5 minutes after
+5 rapid failures. To run it as a user service instead: remove `User=`,
+change `WantedBy=` to `default.target`, install to
 `~/.config/systemd/user/`, then `systemctl --user enable --now
-ebird-discord-bot` and `loginctl enable-linger $USER` so it keeps running
-without an open session.
+ebird-discord-bot` and `loginctl enable-linger $USER`.
 
-## How it works
+### Storage
 
-- Photo metadata comes from the public JSON search API behind
-  `media.ebird.org` (Macaulay Library media search), filtered by checklist
-  (`subId=…`, `mediaType=photo`) and paginated with `initialCursorMark`.
-  No API key required.
-- Images embed straight from Cornell's CDN
-  (`cdn.download.ams.birds.cornell.edu/api/v2/asset/<id>/1200`), which serves
-  all clients; the bot never downloads or rehosts photos.
-- Cornell fronts its sites with an anti-bot challenge (Anubis) for
-  **browser-like** clients. This bot sends an honest, non-browser
-  `User-Agent` (`ebird-checklist-discord-bot/1.0`), which the policy lets
-  through. Don't "upgrade" it to a browser UA string; that gets challenged
-  and the API will return HTML instead of JSON.
+Everything the bot remembers (learned names, `/iam` links, alert
+subscriptions and their history) is one SQLite file, `bot.db`, beside
+`bot.py`; no extra software needed. It's created readable by the service
+user only, and writes are transactions, so a crash can't half-update it.
+On the first start after upgrading, old `aliases.json` and
+`subscriptions.json` files are imported and renamed `*.migrated`. The
+`bot.db-wal` and `bot.db-shm` files are normal SQLite operation. Back up by
+copying `bot.db` while stopped, or `sqlite3 bot.db ".backup bot-backup.db"`
+while running.
 
-## Limits and notes
+## Notes
 
-- Posts at most 50 photos per command (one message each) and links the
-  checklist for the rest; fetches at most 400 via pagination. Large batches
-  post gradually as Discord's rate limits allow.
+- Data comes from the public JSON search API behind media.ebird.org,
+  paginated with `initialCursorMark`; no API key.
+- Images embed straight from Cornell's CDN; the bot never downloads or
+  rehosts photos.
+- The bot sends an honest non-browser `User-Agent`
+  (`ebird-checklist-discord-bot/1.0`). Cornell challenges browser-like
+  clients (Anubis), so switching to a browser UA string breaks the API
+  (HTML instead of JSON).
+- At most 50 photos post per command (400 fetched via pagination); the
+  checklist link covers the rest. Large batches post as Discord's rate
+  limits allow.
 - Public media only; a hidden checklist comes back as "no public photos".
-- Rarities still pending eBird regional review are included (`unconfirmed=incl`;
-  the search index omits them by default) and marked "⚠️ Unconfirmed".
-- Photos are © their photographers, archived by the Macaulay Library. The bot
-  links and embeds rather than copying; keep usage within the
+  Rarities pending review are included (`unconfirmed=incl`) and marked.
+- Photos are © their photographers, archived by the Macaulay Library. The
+  bot links and embeds rather than copying; keep usage within the
   [Cornell Lab terms of use](https://www.birds.cornell.edu/home/terms-of-use/).
