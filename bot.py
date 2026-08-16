@@ -26,6 +26,7 @@ from ebird_media import (
     COMPACT_BRIEF_FLAG,
     COMPACT_CAMERA_FLAG,
     COMPACT_FLAG,
+    STATUS_PENDING,
     STATUS_REJECTED,
     AssetDetails,
     ChecklistError,
@@ -804,8 +805,10 @@ def build_rare_digest(region_code: str, days: int, reports: list[RareReport]) ->
         observer = report.observer if len(report.observer) <= 24 else report.observer[:23] + "…"
         context = " · ".join(bit for bit in (report.obs_dt, location, observer) if bit)
         camera = " 📷" if report.details else ""
+        pending = " ⚠️" if report.status == STATUS_PENDING else ""
         entry = (
-            f"{report.rarity_emoji} **{report.common_name}**{camera} · {report.rarity_label}\n"
+            f"{report.rarity_emoji} **{report.common_name}**{pending}{camera}"
+            f" · {report.rarity_label}\n"
             f"{context} · [checklist]({report.checklist_url})"
         )
         if used + len(entry) + 2 > DIGEST_BUDGET:
@@ -819,10 +822,15 @@ def build_rare_digest(region_code: str, days: int, reports: list[RareReport]) ->
         color=EMBED_COLOR,
     )
     with_photos = sum(1 for report in reports if report.details)
-    embed.set_footer(
-        text=f"{len(reports)} eBird-confirmed report(s) · last {days} days · "
-             f"📷 = has a photo ({with_photos})"
-    )
+    unconfirmed = sum(1 for report in reports if report.status == STATUS_PENDING)
+    bits = [
+        f"{len(reports)} report(s)",
+        f"last {days} days",
+        f"📷 = has a photo ({with_photos})",
+    ]
+    if unconfirmed:
+        bits.append(f"⚠️ = unconfirmed ({unconfirmed})")
+    embed.set_footer(text=" · ".join(bits))
     return embed
 
 
@@ -859,14 +867,15 @@ def build_rare_embed(report: RareReport, compact_flag: str | None) -> discord.Em
 
 @bot.tree.command(
     name="rare",
-    description="Recent eBird-confirmed rare bird reports with photos for a region",
+    description="Recent rare bird reports for a region, confirmed or not",
 )
 @app_commands.describe(
     region="eBird region — code (US-WA, US-WA-033) or name (king county wa)",
     count="How many reports to post (1–25, default 10)",
     days="How many days back to search (1–30, default 14)",
     repeats="Allow several reports of the same species (default: most recent of each)",
-    text="Text-only: drop the photo requirement and post one summary embed",
+    confirmed="Only reports eBird reviewers have accepted (default: unconfirmed included)",
+    photos="Only reports with a public photo, posted as photo embeds (default: one text digest)",
     detail=DETAIL_HELP,
 )
 @app_commands.choices(detail=DETAIL_CHOICES)
@@ -876,7 +885,8 @@ async def rare_command(
     count: app_commands.Range[int, 1, 25] = 10,
     days: app_commands.Range[int, 1, 30] = 14,
     repeats: bool = False,
-    text: bool = False,
+    confirmed: bool = False,
+    photos: bool = False,
     detail: app_commands.Choice[str] | None = None,
 ) -> None:
     delivery = await defer_privately(interaction)
@@ -884,29 +894,30 @@ async def rare_command(
     try:
         region_code, reports = await fetch_rare_reports(
             region, count=count, days=days, unique_species=not repeats,
-            require_photo=not text,
-            include_exif=not text and compact_flag != COMPACT_FLAG,
+            require_photo=photos, confirmed_only=confirmed,
+            include_exif=photos and compact_flag != COMPACT_FLAG,
         )
     except ChecklistError as error:
         await delivery.notice(str(error))
         return
     if not reports:
-        qualifier = "" if text else " with public photos"
+        kind = "eBird-confirmed rarities" if confirmed else "rarities"
+        qualifier = " with public photos" if photos else ""
         await delivery.notice(
-            f"No eBird-confirmed rarities{qualifier} in `{region_code}` "
-            f"over the last {days} days."
+            f"No {kind}{qualifier} in `{region_code}` over the last {days} days."
         )
         return
 
-    if text:
+    if not photos:
         await delivery.send(embed=build_rare_digest(region_code, days, reports))
         await delivery.finish(f"Sent the `{region_code}` rarity digest to your DMs.")
         return
 
     learn_names([(r.details.photo.photographer, r.details.photo.user_id) for r in reports if r.details])
     plural = "ies" if len(reports) != 1 else "y"
+    kind = "confirmed " if confirmed else ""
     await delivery.send(
-        content=f"**{len(reports)} confirmed rarit{plural} with photos** · `{region_code}` · "
+        content=f"**{len(reports)} {kind}rarit{plural} with photos** · `{region_code}` · "
         f"last {days} days · [region page](<https://ebird.org/region/{region_code}>)"
     )
     for report in reports:
