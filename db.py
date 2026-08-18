@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS seen (
     status  TEXT NOT NULL DEFAULT '',
     species TEXT NOT NULL DEFAULT '',  -- common name, for showing back in /alerts
     rarity  TEXT NOT NULL DEFAULT '',  -- "🟠 Very rare"; empty when never rated
+    place   TEXT NOT NULL DEFAULT '',  -- "King" / "King, Washington" per region scope
     PRIMARY KEY (user_id, region, key),
     FOREIGN KEY (user_id, region)
         REFERENCES subscriptions (user_id, region) ON DELETE CASCADE
@@ -64,6 +65,7 @@ _UPGRADES = (
     ("seen", "species", "TEXT NOT NULL DEFAULT ''"),
     ("seen", "rarity", "TEXT NOT NULL DEFAULT ''"),
     ("subscriptions", "show_rarity", "INTEGER NOT NULL DEFAULT 0"),
+    ("seen", "place", "TEXT NOT NULL DEFAULT ''"),
 )
 
 
