@@ -20,7 +20,7 @@ import sys
 import time
 from collections import Counter
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 
 import aiohttp
 
@@ -33,7 +33,8 @@ SPPLIST_URL = "https://api.ebird.org/v2/product/spplist/{region_code}"
 TAXONOMY_URL = "https://api.ebird.org/v2/ref/taxonomy/ebird"
 NOTABLE_URL = "https://api.ebird.org/v2/data/obs/{region_code}/recent/notable"
 REGION_INFO_URL = "https://api.ebird.org/v2/ref/region/info/{region_code}"
-MEDIA_COUNT_URL = "https://media.ebird.org/api/v2/stats/media-count"
+HISTORIC_URL = "https://api.ebird.org/v2/data/obs/{region_code}/historic/{y}/{m}/{d}"
+DAY_STATS_URL = "https://api.ebird.org/v2/product/stats/{region_code}/{y}/{m}/{d}"
 NOTABLE_MAX_DAYS = 30  # eBird's cap on the `back` window
 RARE_SCAN_MAX = 120    # most candidate reports to check for usable media
 # A fetched notable feed is reused for this long, shared by every caller. Keep
@@ -46,17 +47,22 @@ STATUS_CONFIRMED = "confirmed"  # a reviewer accepted it
 STATUS_PENDING = "pending"      # flagged, nobody has looked yet
 STATUS_REJECTED = "rejected"    # reviewed and not accepted
 
-# Rarity tiers by the species' share of the region's photos from *earlier* years —
-# an effort-normalized proxy for how seldom it is documented there. Excluding the
-# current year keeps a mega that fifty people just photographed from reading common.
+# Rarity tiers by seasonal report frequency: of ~30 sampled days in the same
+# season across the prior RARITY_YEARS years, on what share was the species
+# reported (reviewer-accepted records) in this region? This mirrors eBird's own
+# frequency measure and its season-specific filters; prior years only, so a
+# mega that fifty people are chasing right now can't read as common.
 RARITY_TIERS = (
-    (0.005, "Mega rarity", "🔴"),
-    (0.03, "Very rare", "🟠"),
-    (0.12, "Rare", "🟡"),
-    (0.40, "Scarce", "🟢"),
+    (0.1, "Mega rarity", "🔴"),   # never reported in the sampled season-days
+    (7.0, "Very rare", "🟠"),     # 1-2 of ~30 days
+    (20.0, "Rare", "🟡"),         # up to ~1 day in 5
+    (45.0, "Scarce", "🟢"),       # up to ~4 days in 9
     (float("inf"), "Locally notable", "⚪"),
 )
-RARITY_MIN_BASELINE = 500  # below this many prior photos, fall back to all-time counts
+RARITY_YEARS = 6              # how many prior years the season sample spans
+RARITY_OFFSETS = (-14, -7, 0, 7, 14)  # sampled days around today's date, each year
+RARITY_MIN_EFFORT = 60        # checklists across the sampled days; below this a
+                              # county's baseline escalates to its state, etc.
 # eBird's own key for its public web autocomplete widgets (not a personal API key)
 EBIRD_WEB_KEY = "jfekjedvescr"
 SORT_BEST = "rating_rank_desc"     # Macaulay "Best quality" ranking
@@ -212,8 +218,8 @@ class RareReport:
     reports_in_window: int   # other reports of this species in the same window
     rarity_label: str
     rarity_emoji: str
-    rarity_share: float | None  # % of the region's photos, None if unknown
-    rarity_note: str            # e.g. "8 prior photos in US-WA"
+    rarity_share: float | None  # % of sampled season-days with a report, None if unknown
+    rarity_note: str            # e.g. "reported 2 of 30 season-days since 2020 in US-WA-033"
     details: AssetDetails | None   # None in text mode, where photos aren't fetched
     status: str = STATUS_CONFIRMED
     latitude: float | None = None
@@ -240,17 +246,18 @@ class RareReport:
 
     @property
     def status_display(self) -> str:
+        """eBird's own terms: a record is Confirmed or Unconfirmed until rejected."""
         if self.status == STATUS_CONFIRMED:
-            return "✅ Reviewed & accepted"
+            return "✅ Confirmed"
         if self.status == STATUS_REJECTED:
-            return "❌ Reviewed & not accepted"
-        return "⏳ Unconfirmed — awaiting eBird review"
+            return "❌ Not accepted"
+        return "⏳ Unconfirmed"
 
     @property
     def rarity_display(self) -> str:
         if self.rarity_share is None:
             return self.rarity_label
-        return f"{self.rarity_label} · {self.rarity_note} ({self.rarity_share:.2g}%)"
+        return f"{self.rarity_label} · {self.rarity_note}"
 
 
 @dataclass(frozen=True)
@@ -1029,72 +1036,136 @@ async def fetch_checklist_photos(
     return _group_by_species([_to_photo(item) for item in items[:MAX_PHOTOS]])
 
 
-_MEDIA_COUNT_CACHE: dict[tuple[str, str], dict] = {}
+# (scope, "MM-DD") -> season baseline; today's date is part of the key, so a
+# long-running bot naturally refreshes as the season moves
+_SEASON_CACHE: dict[tuple[str, str], dict] = {}
 
 
-async def _media_count(
-    region_code: str, taxon_code: str, session: aiohttp.ClientSession, end_year: int | None = None
-) -> dict:
-    """{'photo': n, …} for a region (and optionally one species); cached, best-effort."""
-    key = (region_code, taxon_code, str(end_year or ""))
-    if key in _MEDIA_COUNT_CACHE:
-        return _MEDIA_COUNT_CACHE[key]
-    params = {"regionCode": region_code}
-    if taxon_code:
-        params["taxonCode"] = taxon_code
-    if end_year:
-        params["endYear"] = str(end_year)
-    data: dict = {}
+def _season_day(year: int, month: int, day: int, offset: int) -> date:
+    """The anchor date shifted into another year, tolerating Feb 29."""
+    while True:
+        try:
+            return date(year, month, day) + timedelta(days=offset)
+        except ValueError:
+            day -= 1
+
+
+async def _get_json(url: str, session: aiohttp.ClientSession):
     try:
         async with session.get(
-            MEDIA_COUNT_URL, params=params,
+            url, params={"key": EBIRD_WEB_KEY},
             headers={"Accept": "application/json", "User-Agent": USER_AGENT},
             timeout=aiohttp.ClientTimeout(total=20),
         ) as resp:
             if resp.status == 200:
-                payload = await resp.json(content_type=None)
-                if isinstance(payload, dict):
-                    data = payload
+                return await resp.json(content_type=None)
     except (aiohttp.ClientError, asyncio.TimeoutError):
         pass  # rarity is a nice-to-have; a failure just means "unknown"
-    _MEDIA_COUNT_CACHE[key] = data
-    return data
+    return None
 
 
-def _rarity_scope(region_code: str) -> str:
-    """Counties are ranked against their state; everything else against itself."""
-    return region_code.rsplit("-", 1)[0] if region_code.count("-") == 2 else region_code
+async def _fetch_season_baseline(scope: str, session: aiohttp.ClientSession) -> dict:
+    """Which species were reported in `scope` around this date in prior years.
+
+    Samples RARITY_OFFSETS days around today's month/day in each of the prior
+    RARITY_YEARS years (~30 past days) and records, per species, how many of
+    those days it was reported on (reviewer-accepted records only). Daily
+    checklist totals ride along so callers can judge whether there was enough
+    birding effort here for the answer to mean anything.
+    """
+    anchor = date.today()
+    key = (scope, f"{anchor.month:02d}-{anchor.day:02d}")
+    cached = _SEASON_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if len(_SEASON_CACHE) > 32:
+        _SEASON_CACHE.clear()  # cheap bound; entries go stale daily anyway
+
+    years = range(anchor.year - RARITY_YEARS, anchor.year)
+    days = [
+        _season_day(year, anchor.month, anchor.day, offset)
+        for year in years
+        for offset in RARITY_OFFSETS
+    ]
+    semaphore = asyncio.Semaphore(6)
+
+    async def species_on(day: date):
+        async with semaphore:
+            return await _get_json(
+                HISTORIC_URL.format(region_code=scope, y=day.year, m=day.month, d=day.day),
+                session,
+            )
+
+    async def checklists_on(day: date):
+        async with semaphore:
+            stats = await _get_json(
+                DAY_STATS_URL.format(region_code=scope, y=day.year, m=day.month, d=day.day),
+                session,
+            )
+            return (stats or {}).get("numChecklists") or 0
+
+    day_lists = await asyncio.gather(*(species_on(day) for day in days))
+    # effort is gauged on the anchor day of each year: one stats call per year
+    effort = await asyncio.gather(
+        *(checklists_on(_season_day(year, anchor.month, anchor.day, 0)) for year in years)
+    )
+
+    day_counts: dict[str, int] = {}
+    sampled = 0
+    for observations in day_lists:
+        if observations is None:
+            continue  # fetch failed; don't count the day as sampled
+        sampled += 1
+        for code in {o.get("speciesCode") for o in observations if isinstance(o, dict)}:
+            if code:
+                day_counts[code] = day_counts.get(code, 0) + 1
+    baseline = {
+        "days": day_counts,
+        "sampled": sampled,
+        "since": years[0],
+        "scope": scope,
+        "checklists": sum(effort),
+    }
+    _SEASON_CACHE[key] = baseline
+    return baseline
+
+
+async def _season_baseline(region_code: str, session: aiohttp.ClientSession) -> dict:
+    """The season baseline at the queried scale, escalating only when birding
+    effort there is too thin to rank against (and saying so via 'scope')."""
+    scope = region_code
+    while True:
+        baseline = await _fetch_season_baseline(scope, session)
+        enough = baseline["sampled"] and baseline["checklists"] >= RARITY_MIN_EFFORT
+        if enough or "-" not in scope:
+            return baseline
+        scope = scope.rsplit("-", 1)[0]  # county -> state -> country
 
 
 async def _warm_rarity_baseline(region_code: str, session: aiohttp.ClientSession) -> None:
-    """Fetch the region's photo totals once, so parallel lookups all hit the cache."""
-    scope = _rarity_scope(region_code)
-    total = (await _media_count(scope, "", session, date.today().year - 1)).get("photo") or 0
-    if total < RARITY_MIN_BASELINE:
-        await _media_count(scope, "", session)
+    """Build the region's season baseline once, so parallel lookups hit the cache."""
+    await _season_baseline(region_code, session)
 
 
 async def _rarity(
     region_code: str, species_code: str, session: aiohttp.ClientSession
 ) -> tuple[str, str, float | None, str]:
-    """(label, emoji, share, note) for how seldom a species is photographed here.
+    """(label, emoji, share, note): how often this species is reported here in season.
 
-    Rarity is judged at state/province scale even for a county query: the
-    counts are far more stable, and it matches how birders rank a record.
+    Frequency of reviewer-accepted reports, at the scale actually queried
+    (a county ranks against itself when it has real coverage), in this
+    season across prior years; eBird's own kind of measure.
     """
-    scope = _rarity_scope(region_code)
-    end_year: int | None = date.today().year - 1
-    total = (await _media_count(scope, "", session, end_year)).get("photo") or 0
-    if total < RARITY_MIN_BASELINE:
-        # thin history (or a region that only recently got coverage): use everything
-        end_year = None
-        total = (await _media_count(scope, "", session)).get("photo") or 0
-    if not total:
+    baseline = await _season_baseline(region_code, session)
+    sampled = baseline["sampled"]
+    if not sampled:
         return "Notable sighting", "⚪", None, ""
-    mine = (await _media_count(scope, species_code, session, end_year)).get("photo") or 0
-    share = 100 * mine / total
-    window = f"prior photo{'' if mine == 1 else 's'}" if end_year else f"photo{'' if mine == 1 else 's'}"
-    note = f"{mine:,} {window} in {scope}"
+    mine = baseline["days"].get(species_code, 0)
+    share = 100 * mine / sampled
+    note = (
+        f"reported {mine} of {sampled} season-days since {baseline['since']}"
+        f" in {baseline['scope']}"
+    )
     for threshold, label, emoji in RARITY_TIERS:
         if share < threshold:
             return label, emoji, share, note
