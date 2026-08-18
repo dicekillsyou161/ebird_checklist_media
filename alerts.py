@@ -47,7 +47,7 @@ _SEEN_WIDTH = 4
 
 _SUB_COLUMNS = (
     "user_id, region, region_label, min_rarity, confirmations, "
-    "created, alerts_sent, last_alert, paused, failures"
+    "created, alerts_sent, last_alert, paused, failures, show_rarity"
 )
 
 
@@ -65,6 +65,7 @@ class Subscription:
     last_alert: str = ""
     paused: bool = False        # DMs kept failing; user must re-subscribe
     failures: int = 0
+    show_rarity: bool = False   # opt-in estimated tier labels in alert DMs
     # notable_key -> [obsDt, status] of what has already been delivered
     seen: dict[str, list[str]] = field(default_factory=dict)
 
@@ -89,6 +90,7 @@ class Subscription:
             self.user_id, self.region, self.region_label, self.min_rarity,
             int(self.confirmations), self.created, self.alerts_sent,
             self.last_alert, int(self.paused), self.failures,
+            int(self.show_rarity),
         )
 
     @classmethod
@@ -104,6 +106,7 @@ class Subscription:
             last_alert=row["last_alert"],
             paused=bool(row["paused"]),
             failures=row["failures"],
+            show_rarity=bool(row["show_rarity"]),
         )
 
     @property
@@ -188,7 +191,7 @@ class AlertStore:
                     continue
                 cursor = self.conn.execute(
                     f"INSERT OR IGNORE INTO subscriptions ({_SUB_COLUMNS})"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     sub.to_row(),
                 )
                 if cursor.rowcount:
@@ -232,7 +235,7 @@ class AlertStore:
             for sub in self.subscriptions:
                 self.conn.execute(
                     f"INSERT INTO subscriptions ({_SUB_COLUMNS})"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     sub.to_row(),
                 )
                 self.conn.executemany(
