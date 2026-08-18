@@ -168,6 +168,14 @@ class Photo:
         return self.media_type in ("photo", "video")
 
     @property
+    def media_url(self) -> str:
+        """Direct mp3/mp4 URL for audio and video; a bare link to it in
+        message content makes Discord render an inline player. Empty for photos."""
+        if self.media_type in ("audio", "video"):
+            return f"https://cdn.download.ams.birds.cornell.edu/api/v1/asset/{self.asset_id}"
+        return ""
+
+    @property
     def type_label(self) -> str:
         if self.media_type == "audio":
             return "🎧 Audio recording"
