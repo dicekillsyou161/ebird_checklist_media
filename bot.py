@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import re
+import traceback
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -359,6 +360,28 @@ class ChecklistBot(discord.Client):
 
 
 bot = ChecklistBot()
+
+
+@bot.tree.error
+async def on_command_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+) -> None:
+    """Answer the interaction on any crash, so commands never hang on 'thinking'."""
+    cause = getattr(error, "original", error)
+    name = interaction.command.name if interaction.command else "?"
+    print(f"Command /{name} failed: {cause!r}")
+    traceback.print_exception(type(cause), cause, cause.__traceback__)
+    message = (
+        f"⚠️ `/{name}` hit an internal error ({type(cause).__name__}). "
+        "The full traceback is in the bot's log (`journalctl -u ebird-discord-bot`)."
+    )
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        pass  # the interaction may have expired; the log still has the traceback
 
 
 @bot.event
