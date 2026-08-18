@@ -219,7 +219,7 @@ class RareReport:
     rarity_label: str
     rarity_emoji: str
     rarity_share: float | None  # % of sampled season-days with a report, None if unknown
-    rarity_note: str            # e.g. "2+ confirmed reports in season since 2020 in US-WA-033"
+    rarity_note: str            # e.g. "2+ confirmed reports during Aug 4-Sep 1, 2020-2025, in US-WA-033"
     details: AssetDetails | None   # None in text mode, where photos aren't fetched
     status: str = STATUS_CONFIRMED
     latitude: float | None = None
@@ -1120,12 +1120,19 @@ async def _fetch_season_baseline(scope: str, session: aiohttp.ClientSession) -> 
         for code in {o.get("speciesCode") for o in observations if isinstance(o, dict)}:
             if code:
                 day_counts[code] = day_counts.get(code, 0) + 1
+    window_start = _season_day(anchor.year, anchor.month, anchor.day, min(RARITY_OFFSETS))
+    window_end = _season_day(anchor.year, anchor.month, anchor.day, max(RARITY_OFFSETS))
     baseline = {
         "days": day_counts,
         "sampled": sampled,
         "since": years[0],
         "scope": scope,
         "checklists": sum(effort),
+        "season": (
+            f"{window_start.strftime('%b')} {window_start.day}-"
+            f"{window_end.strftime('%b')} {window_end.day}"
+        ),
+        "years": f"{years[0]}-{years[-1]}",
     }
     _SEASON_CACHE[key] = baseline
     return baseline
@@ -1166,7 +1173,10 @@ async def _rarity(
     # each sampled day the species appeared carries at least one accepted
     # record, so the day count is a floor on confirmed reports; "+" says so
     count = f"{mine}+ confirmed reports" if mine else "no confirmed reports"
-    note = f"{count} in season since {baseline['since']} in {baseline['scope']}"
+    note = (
+        f"{count} during {baseline['season']}, {baseline['years']},"
+        f" in {baseline['scope']}"
+    )
     for threshold, label, emoji in RARITY_TIERS:
         if share < threshold:
             return label, emoji, share, note
