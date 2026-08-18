@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     last_alert    TEXT NOT NULL DEFAULT '',
     paused        INTEGER NOT NULL DEFAULT 0,
     failures      INTEGER NOT NULL DEFAULT 0,
+    show_rarity   INTEGER NOT NULL DEFAULT 0,  -- opt-in tier labels in alert DMs
     PRIMARY KEY (user_id, region)
 );
 CREATE TABLE IF NOT EXISTS seen (
@@ -62,6 +63,7 @@ CREATE TABLE IF NOT EXISTS seen (
 _UPGRADES = (
     ("seen", "species", "TEXT NOT NULL DEFAULT ''"),
     ("seen", "rarity", "TEXT NOT NULL DEFAULT ''"),
+    ("subscriptions", "show_rarity", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
