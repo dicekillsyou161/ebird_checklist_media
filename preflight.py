@@ -92,7 +92,7 @@ try:
     conn = db_module.connect(HERE / "bot.db")
     for table, needed in (
         ("subscriptions", {c.strip() for c in alerts_module._SUB_COLUMNS.split(",")}),
-        ("seen", {"user_id", "region", "key", "obs_dt", "status", "species", "rarity"}),
+        ("seen", {"user_id", "region", "key", "obs_dt", "status", "species", "rarity", "place"}),
     ):
         have = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
         missing = needed - have
