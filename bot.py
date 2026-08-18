@@ -1,1632 +1,1601 @@
-"""Fetch public Macaulay Library photos for an eBird checklist.
-
-Data source: the public JSON search API behind media.ebird.org (Macaulay
-Library media search), filtered by checklist via ``subId``. No API key is
-required, but requests must send a non-browser User-Agent and
-``Accept: application/json`` — browser-like clients are served an
-interactive anti-bot challenge instead of JSON.
-
-Run standalone to test without Discord:
-
-    python ebird_media.py S378216909
-    python ebird_media.py -vvv S378216909   # include each photo's metadata
-"""
+"""Discord bot: /checklist <eBird checklist> posts every public Macaulay Library photo."""
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
-import sys
-import time
+import traceback
 from collections import Counter
-from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 import aiohttp
+import discord
+from discord import app_commands
+from dotenv import load_dotenv
 
-API_URL = "https://media.ebird.org/api/v2/search"
-ASSET_PAGE = "https://macaulaylibrary.org/asset/{asset_id}"
-TAXON_FIND_URL = "https://api.ebird.org/v2/ref/taxon/find"
-REGION_FIND_URL = "https://api.ebird.org/v2/ref/region/find"
-REGION_LIST_URL = "https://api.ebird.org/v2/ref/region/list/{kind}/{parent}"
-SPPLIST_URL = "https://api.ebird.org/v2/product/spplist/{region_code}"
-TAXONOMY_URL = "https://api.ebird.org/v2/ref/taxonomy/ebird"
-NOTABLE_URL = "https://api.ebird.org/v2/data/obs/{region_code}/recent/notable"
-REGION_INFO_URL = "https://api.ebird.org/v2/ref/region/info/{region_code}"
-HISTORIC_URL = "https://api.ebird.org/v2/data/obs/{region_code}/historic/{y}/{m}/{d}"
-DAY_STATS_URL = "https://api.ebird.org/v2/product/stats/{region_code}/{y}/{m}/{d}"
-NOTABLE_MAX_DAYS = 30  # eBird's cap on the `back` window
-RARE_SCAN_MAX = 120    # most candidate reports to check for usable media
-# A fetched notable feed is reused for this long, shared by every caller. Keep
-# it well under the alert poll interval so alerts never run on stale data.
-NOTABLE_CACHE_SECONDS = 120
-_NOTABLE_CACHE: dict[tuple[str, int], tuple[float, list[dict]]] = {}
-
-# Where eBird's regional review stands on a flagged record.
-STATUS_CONFIRMED = "confirmed"  # a reviewer accepted it
-STATUS_PENDING = "pending"      # flagged, nobody has looked yet
-STATUS_REJECTED = "rejected"    # reviewed and not accepted
-
-# Rarity tiers by seasonal report frequency: of ~30 sampled days in the same
-# season across the prior RARITY_YEARS years, on what share was the species
-# reported (reviewer-accepted records) in this region? This mirrors eBird's own
-# frequency measure and its season-specific filters; prior years only, so a
-# mega that fifty people are chasing right now can't read as common.
-RARITY_TIERS = (
-    (0.1, "Mega rarity", "🔴"),   # never reported in the sampled season-days
-    (7.0, "Very rare", "🟠"),     # 1-2 of ~30 days
-    (20.0, "Rare", "🟡"),         # up to ~1 day in 5
-    (45.0, "Scarce", "🟢"),       # up to ~4 days in 9
-    (float("inf"), "Locally notable", "⚪"),
+import db
+from alerts import (
+    CONFIRMATION,
+    RARITY_LEVELS,
+    STATUS_MARKS,
+    AlertStore,
+    Subscription,
 )
-RARITY_YEARS = 6              # how many prior years the season sample spans
-RARITY_OFFSETS = (-14, -7, 0, 7, 14)  # sampled days around today's date, each year
-RARITY_MIN_EFFORT = 60        # checklists across the sampled days; below this a
-                              # county's baseline escalates to its state, etc.
-# eBird's own key for its public web autocomplete widgets (not a personal API key)
-EBIRD_WEB_KEY = "jfekjedvescr"
-SORT_BEST = "rating_rank_desc"     # Macaulay "Best quality" ranking
-SORT_RECENT = "upload_date_desc"   # most recently uploaded
-SORT_OBS = "obs_date_desc"         # most recent observation date/time
-USER_AGENT = "ebird-checklist-discord-bot/1.0"
-PAGE_SIZE = 100
-MAX_PHOTOS = 400  # safety cap so one request can't paginate forever
-GROUP_GLOBAL_MAX = 40  # most species a userless group:True search will fan out to
-VERBOSE_FLAG = "-vvv"          # add every metadata detail
-COMPACT_CAMERA_FLAG = "-c"     # compact + key camera settings + observed/location
-COMPACT_BRIEF_FLAG = "-cc"     # compact + focal length + observed/location
-COMPACT_FLAG = "-ccc"          # cut to species + links + rating only
-FLAGS = {VERBOSE_FLAG, COMPACT_CAMERA_FLAG, COMPACT_BRIEF_FLAG, COMPACT_FLAG}
+from ebird_media import (
+    COMPACT_BRIEF_FLAG,
+    COMPACT_CAMERA_FLAG,
+    COMPACT_FLAG,
+    STATUS_PENDING,
+    STATUS_REJECTED,
+    AssetDetails,
+    ChecklistError,
+    Photo,
+    SORT_BEST,
+    SORT_OBS,
+    SORT_RECENT,
+    RareReport,
+    attach_photos,
+    build_rare_reports,
+    fetch_asset_details,
+    fetch_checklist_photos,
+    fetch_notable,
+    fetch_rare_reports,
+    fetch_user_details,
+    notable_key,
+    notable_status,
+    parse_asset_id,
+    parse_checklist_id,
+    region_name,
+    resolve_region_code,
+    select_fields,
+    species_rarity,
+)
 
-# What each partial-compact flag adds on top of the species+links+rating base.
-# ("camera", …) labels come from the asset page EXIF; ("base", …) from the search API.
-COMPACT_SELECTIONS = {
-    COMPACT_CAMERA_FLAG: (
-        ("camera", "Focal length"),
-        ("camera", "Exposure"),
-        ("camera", "Aperture"),
-        ("camera", "ISO"),
-        ("base", "Observed"),
-        ("base", "Location"),
-    ),
-    COMPACT_BRIEF_FLAG: (
-        ("camera", "Focal length"),
-        ("base", "Observed"),
-        ("base", "Location"),
-    ),
-    COMPACT_FLAG: (),
+load_dotenv()
+
+MAX_PHOTOS_POSTED = 50  # keep one command from flooding a channel
+EMBEDS_PER_MESSAGE = 10  # Discord's per-message embed limit
+FIELD_VALUE_MAX = 300            # display cap for one metadata value (Discord allows 1024)
+EMBED_COLOR = discord.Color.from_str("#4a7628")  # eBird green
+RARITY_COLORS = {  # only used when a subscriber opts into rarity labels
+    "Mega rarity": discord.Color.from_str("#c62828"),
+    "Very rare": discord.Color.from_str("#ef6c00"),
+    "Rare": discord.Color.from_str("#f9a825"),
+    "Scarce": discord.Color.from_str("#2e7d32"),
 }
 
-_CHECKLIST_RE = re.compile(r"\bS(\d{4,})\b", re.IGNORECASE)
-_AGE_SEX_RE = re.compile(r"(adult|immature|juvenile|unknown)(Female|Male|Unknown)Count")
-_ASSET_URL_RE = re.compile(r"asset/(\d{5,})", re.IGNORECASE)
-_ASSET_ML_RE = re.compile(r"\bML(\d{5,})\b", re.IGNORECASE)
-_ASSET_BARE_RE = re.compile(r"\b(\d{5,})\b")
-_USER_ID_RE = re.compile(r"\bUSER(\d+)\b", re.IGNORECASE)
-_PROFILE_URL_RE = re.compile(r"/profile/[A-Za-z0-9_\-=%]+")
-_REGION_CODE_RE = re.compile(r"^[A-Za-z]{2}(-[A-Za-z0-9]{1,5}){0,2}$")
-
-# The asset page embeds parsed EXIF as {description:"…",exifTagCode:"…"} pairs
-# inside its minified Nuxt state. A pair whose value the minifier hoisted into
-# a variable (rare) is simply skipped.
-_EXIF_ARRAY_RE = re.compile(r"[\"']?exif[\"']?:\[")
-_EXIF_PAIR_RE = re.compile(r'\{description:"((?:[^"\\]|\\.)*)",exifTagCode:"([a-z0-9_]+)"\}')
-_EXIF_LABELS = {
-    "make": "Camera make",
-    "model": "Camera model",
-    "lens_model": "Lens",
-    "focal_length": "Focal length",
-    "exposure_time": "Exposure",
-    "f_number": "Aperture",
-    "iso": "ISO",
-    "flash": "Flash",
-    "create_dt": "Taken",
-    "latitude": "GPS latitude",
-    "longitude": "GPS longitude",
-}
-_EXIF_ORDER = list(_EXIF_LABELS)
-# width/height already appear as the search API's Size field; shutter_speed is
-# exposure_time again, rounded differently ("1/2499 sec" vs "1/2500 sec").
-_EXIF_SKIP = {"width", "height", "shutter_speed"}
+# One `detail` option on every command, in place of the old -c/-cc/-ccc/-vvv
+# text flags. Values are the internal compact-flag constants; "full" means none.
+DETAIL_FULL = "full"
+DETAIL_DEFAULT = COMPACT_BRIEF_FLAG  # what you get when `detail` is left unset
+DETAIL_CHOICES = [
+    app_commands.Choice(
+        name="Brief (default): focal length, when and where", value=COMPACT_BRIEF_FLAG
+    ),
+    app_commands.Choice(
+        name="Camera: focal length, exposure, aperture, ISO, when and where",
+        value=COMPACT_CAMERA_FLAG,
+    ),
+    app_commands.Choice(name="Full: every detail, plus camera EXIF", value=DETAIL_FULL),
+    app_commands.Choice(name="Minimal: species, links and rating only", value=COMPACT_FLAG),
+]
+DETAIL_HELP = "How much metadata to show (default: brief)"
 
 
-class ChecklistError(Exception):
-    """A checklist ID couldn't be parsed, or the photo lookup failed."""
+def detail_flag(choice: app_commands.Choice[str] | None) -> str | None:
+    """The internal compact flag behind a `detail` choice.
 
-
-@dataclass(frozen=True)
-class Photo:
-    asset_id: int
-    common_name: str
-    sci_name: str
-    photographer: str
-    obs_date: str
-    location: str
-    rating: float | None
-    unconfirmed: bool = False  # rarity still pending eBird regional review
-    rating_count: int | None = None
-    species_code: str = ""
-    license_id: str = ""
-    width: int | None = None
-    height: int | None = None
-    latitude: float | None = None
-    longitude: float | None = None
-    obs_time: str = ""
-    age_sex: str = ""
-    notes: str = ""
-    tags: str = ""
-    user_id: str = ""  # eBird USER… ID of the photographer
-    media_type: str = "photo"  # photo | audio | video
-
-    @property
-    def asset_url(self) -> str:
-        return f"https://macaulaylibrary.org/asset/{self.asset_id}"
-
-    @property
-    def has_image(self) -> bool:
-        """Whether the CDN serves a still for this asset (video posters count)."""
-        return self.media_type in ("photo", "video")
-
-    @property
-    def media_url(self) -> str:
-        """Direct mp3/mp4 URL for audio and video; a bare link to it in
-        message content makes Discord render an inline player. Empty for photos."""
-        if self.media_type in ("audio", "video"):
-            return f"https://cdn.download.ams.birds.cornell.edu/api/v1/asset/{self.asset_id}"
-        return ""
-
-    @property
-    def type_label(self) -> str:
-        if self.media_type == "audio":
-            return "🎧 Audio recording"
-        if self.media_type == "video":
-            return "🎥 Video"
-        return ""
-
-    def image_url(self, size: int = 1200) -> str:
-        return f"https://cdn.download.ams.birds.cornell.edu/api/v2/asset/{self.asset_id}/{size}"
-
-    @property
-    def rating_display(self) -> str:
-        if not self.rating:
-            return ""
-        text = f"{round(self.rating, 1):g}/5"
-        if self.rating_count:
-            plural = "s" if self.rating_count != 1 else ""
-            text += f" ({self.rating_count} rating{plural})"
-        return text
-
-    def metadata_fields(self, *, markdown: bool = True) -> list[tuple[str, str]]:
-        """(label, value) pairs for every non-empty metadata detail."""
-        coords = ""
-        if self.latitude is not None and self.longitude is not None:
-            plain = f"{self.latitude:.5f}, {self.longitude:.5f}"
-            coords = (
-                f"[{plain}](https://www.google.com/maps/search/?api=1"
-                f"&query={self.latitude},{self.longitude})"
-            ) if markdown else plain
-        fields = [
-            ("Observed", " · ".join(bit for bit in (self.obs_date, self.obs_time) if bit)),
-            ("Location", self.location),
-            ("Coordinates", coords),
-            ("Age / sex", self.age_sex),
-            ("Rating", self.rating_display),
-            ("Size", f"{self.width} × {self.height} px" if self.width and self.height else ""),
-            ("License", self.license_id),
-            ("Species code", self.species_code),
-            ("Notes", self.notes),
-            ("Tags", self.tags),
-        ]
-        return [(label, value) for label, value in fields if value]
-
-
-@dataclass(frozen=True)
-class AssetDetails:
-    photo: Photo
-    media_type: str
-    checklist_id: str
-    exif: tuple[tuple[str, str], ...]  # (label, value) camera metadata
-
-
-@dataclass(frozen=True)
-class RareReport:
-    common_name: str
-    sci_name: str
-    species_code: str
-    obs_dt: str          # "2026-08-13 17:48" as eBird reports it
-    location: str
-    observer: str
-    checklist_id: str
-    reports_in_window: int   # other reports of this species in the same window
-    rarity_label: str
-    rarity_emoji: str
-    rarity_share: float | None  # % of sampled season-days with a report, None if unknown
-    rarity_note: str            # e.g. "2+ confirmed reports during Aug 4-Sep 1, 2020-2025, in US-WA-033"
-    details: AssetDetails | None   # None in text mode, where photos aren't fetched
-    status: str = STATUS_CONFIRMED
-    latitude: float | None = None
-    longitude: float | None = None
-    how_many: int | None = None    # birds reported, when the observer counted
-    county: str = ""               # subnational2Name, e.g. "King"
-    state: str = ""                # subnational1Name, e.g. "Washington"
-
-    @property
-    def checklist_url(self) -> str:
-        return f"https://ebird.org/checklist/{self.checklist_id}"
-
-    @property
-    def map_url(self) -> str:
-        if self.latitude is None or self.longitude is None:
-            return ""
-        return (
-            "https://www.google.com/maps/search/?api=1"
-            f"&query={self.latitude},{self.longitude}"
-        )
-
-    @property
-    def confirmed(self) -> bool:
-        return self.status == STATUS_CONFIRMED
-
-    @property
-    def status_display(self) -> str:
-        """eBird's own terms: a record is Confirmed or Unconfirmed until rejected."""
-        if self.status == STATUS_CONFIRMED:
-            return "✅ Confirmed"
-        if self.status == STATUS_REJECTED:
-            return "❌ Not accepted"
-        return "⏳ Unconfirmed"
-
-    @property
-    def rarity_display(self) -> str:
-        if self.rarity_share is None:
-            return self.rarity_label
-        return f"{self.rarity_label} · {self.rarity_note}"
-
-
-@dataclass(frozen=True)
-class UserMedia:
-    display_name: str
-    user_id: str
-    species_code: str     # "" when not filtered by species
-    species_display: str  # e.g. "Black Oystercatcher - Haematopus bachmani"
-    details: list[AssetDetails]
-    region: str = ""      # eBird region code when the search was region-limited
-
-
-def parse_asset_id(text: str) -> int:
-    """Accept a Macaulay Library asset URL, an ML number, or bare digits."""
-    for pattern in (_ASSET_URL_RE, _ASSET_ML_RE):
-        match = pattern.search(text)
-        if match:
-            return int(match.group(1))
-    if _CHECKLIST_RE.search(text):
-        raise ChecklistError(
-            "That looks like an eBird *checklist* — use `/checklist` for those. "
-            "This wants a Macaulay Library asset, e.g. "
-            "`https://macaulaylibrary.org/asset/662698120` or `ML662698120`."
-        )
-    match = _ASSET_BARE_RE.search(text)
-    if match:
-        return int(match.group(1))
-    raise ChecklistError(
-        "Couldn't find a Macaulay Library asset in that. Pass a link like "
-        "`https://macaulaylibrary.org/asset/662698120`, or `ML662698120`."
-    )
-
-
-def _extract_exif(page_html: str) -> tuple[tuple[str, str], ...]:
-    match = _EXIF_ARRAY_RE.search(page_html)
-    if not match:
-        return ()
-    window = page_html[match.end():match.end() + 8000]
-    tags: dict[str, str] = {}
-    for raw_desc, code in _EXIF_PAIR_RE.findall(window):
-        if code not in _EXIF_SKIP:
-            tags.setdefault(code, json.loads(f'"{raw_desc}"'))
-    ordered = [c for c in _EXIF_ORDER if c in tags] + [c for c in tags if c not in _EXIF_ORDER]
-    return tuple(
-        (_EXIF_LABELS.get(code, code.replace("_", " ").capitalize()), tags[code])
-        for code in ordered
-    )
-
-
-async def _search(session: aiohttp.ClientSession, **params) -> list[dict]:
-    """One call to the media search API, returning the raw item list."""
-    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
-    query = {key: str(value) for key, value in params.items()}
-    async with session.get(
-        API_URL, params=query, headers=headers, timeout=aiohttp.ClientTimeout(total=25)
-    ) as resp:
-        if resp.status != 200:
-            raise ChecklistError(
-                f"Macaulay Library search returned HTTP {resp.status} — try again in a minute."
-            )
-        if "json" not in (resp.headers.get("Content-Type") or ""):
-            raise ChecklistError(
-                "Macaulay Library returned a non-JSON response "
-                "(possibly an anti-bot challenge — see README notes on the User-Agent)."
-            )
-        page = await resp.json()
-    if not isinstance(page, list):
-        raise ChecklistError("Unexpected response shape from Macaulay Library search.")
-    return page
-
-
-async def _fetch_exif(
-    session: aiohttp.ClientSession, asset_id: int
-) -> tuple[tuple[str, str], ...]:
-    """Camera metadata from the asset page; best-effort, empty on any failure."""
-    try:
-        async with session.get(
-            ASSET_PAGE.format(asset_id=asset_id),
-            headers={"User-Agent": USER_AGENT},
-            timeout=aiohttp.ClientTimeout(total=25),
-        ) as resp:
-            if resp.status == 200:
-                return _extract_exif(await resp.text())
-    except (aiohttp.ClientError, asyncio.TimeoutError):
-        pass
-    return ()
-
-
-def _item_to_details(item: dict, exif: tuple[tuple[str, str], ...]) -> AssetDetails:
-    return AssetDetails(
-        photo=_to_photo(item),
-        media_type=item.get("mediaType") or "",
-        checklist_id=item.get("ebirdChecklistId") or "",
-        exif=exif,
-    )
-
-
-async def fetch_asset_details(
-    asset_id: int, *, session: aiohttp.ClientSession | None = None
-) -> AssetDetails:
-    """Look up one Macaulay Library asset: search-API metadata + page EXIF."""
-    owns_session = session is None
-    if owns_session:
-        session = aiohttp.ClientSession()
-    try:
-        page = await _search(session, assetId=asset_id, unconfirmed="incl")
-        # the API silently ignores unknown params, so confirm we got *this* asset
-        item = next((it for it in page if it.get("assetId") == asset_id), None)
-        if item is None:
-            raise ChecklistError(
-                f"No public Macaulay Library asset `ML{asset_id}` found — "
-                "it may be restricted, deleted, or the number may be wrong."
-            )
-        return _item_to_details(item, await _fetch_exif(session, asset_id))
-    except (aiohttp.ClientError, asyncio.TimeoutError) as error:
-        raise ChecklistError(f"Couldn't reach Macaulay Library ({error.__class__.__name__}).") from error
-    finally:
-        if owns_session:
-            await session.close()
-
-
-async def resolve_user(text: str, *, session: aiohttp.ClientSession) -> str:
-    """Turn user input into a USER… ID: accepts the ID itself, bare digits,
-    or any Macaulay Library asset link/number by that person."""
-    match = _USER_ID_RE.search(text)
-    if match:
-        return f"USER{match.group(1)}"
-    if _PROFILE_URL_RE.search(text):
-        raise ChecklistError(
-            "eBird profile pages need a sign-in, so I can't read the user ID from "
-            "that link. Pass one of their Macaulay Library asset links instead "
-            "(e.g. `ML662698120`), or their `USER…` ID."
-        )
-    if _ASSET_URL_RE.search(text) or _ASSET_ML_RE.search(text):
-        asset_id = parse_asset_id(text)
-        page = await _search(session, assetId=asset_id, unconfirmed="incl")
-        item = next((it for it in page if it.get("assetId") == asset_id), None)
-        if item and item.get("userId"):
-            return item["userId"]
-        raise ChecklistError(f"Couldn't find the photographer of `ML{asset_id}`.")
-    digits = re.fullmatch(r"\s*(\d{4,})\s*", text)
-    if digits:
-        return f"USER{digits.group(1)}"
-    raise ChecklistError(
-        "Couldn't work out an eBird user from that. Pass their `USER…` ID or "
-        "one of their Macaulay Library asset links (e.g. `ML662698120`)."
-    )
-
-
-async def _find_taxa(
-    query: str, session: aiohttp.ClientSession, *, cat: str = "species", limit: int = 25
-) -> list[dict]:
-    """Raw fuzzy taxon matches [{code, name}, …] for a name query."""
-    params = {"locale": "en", "cat": cat, "limit": str(limit), "key": EBIRD_WEB_KEY, "q": query}
-    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
-    async with session.get(
-        TAXON_FIND_URL, params=params, headers=headers,
-        timeout=aiohttp.ClientTimeout(total=25),
-    ) as resp:
-        if resp.status != 200:
-            raise ChecklistError(f"Species lookup returned HTTP {resp.status} — try again in a minute.")
-        matches = await resp.json(content_type=None)
-    return matches if isinstance(matches, list) else []
-
-
-def _merge_key(sort: str):
-    """Cross-species ordering for merged global-group results."""
-    if sort == SORT_OBS:
-        return lambda item: item.get("obsDt") or ""
-    if sort == SORT_RECENT:
-        return lambda item: item.get("assetId") or 0
-
-    def quality(item: dict) -> float:
-        # approximates Macaulay's Bayesian quality rank: pull low-vote
-        # ratings toward a prior of 3.0 with weight 10
-        rating = item.get("rating") or 0
-        votes = item.get("ratingCount") or 0
-        return (rating * votes + 3.0 * 10) / (votes + 10)
-
-    return quality
-
-
-_REGION_LIST_CACHE: dict[tuple[str, str], list[dict]] = {}
-# words to drop when reading a place name: "king county wa" == "king wa"
-_ADMIN_WORDS = {"county", "co", "parish", "borough", "municipality", "state", "province"}
-
-
-async def _region_list(kind: str, parent: str, session: aiohttp.ClientSession) -> list[dict]:
-    """[{code, name}, …] of a region's children (cached); empty if unavailable."""
-    key = (kind, parent)
-    if key in _REGION_LIST_CACHE:
-        return _REGION_LIST_CACHE[key]
-    rows: list[dict] = []
-    try:
-        async with session.get(
-            REGION_LIST_URL.format(kind=kind, parent=parent),
-            params={"key": EBIRD_WEB_KEY},
-            headers={"Accept": "application/json", "User-Agent": USER_AGENT},
-            timeout=aiohttp.ClientTimeout(total=25),
-        ) as resp:
-            if resp.status == 200:
-                payload = await resp.json(content_type=None)
-                if isinstance(payload, list):
-                    rows = payload
-    except (aiohttp.ClientError, asyncio.TimeoutError):
-        pass
-    _REGION_LIST_CACHE[key] = rows
-    return rows
-
-
-async def _find_regions(query: str, session: aiohttp.ClientSession) -> list[dict]:
-    """Raw fuzzy region matches; names look like 'King, Washington, United States (US)'."""
-    async with session.get(
-        REGION_FIND_URL, params={"q": query, "key": EBIRD_WEB_KEY},
-        headers={"Accept": "application/json", "User-Agent": USER_AGENT},
-        timeout=aiohttp.ClientTimeout(total=25),
-    ) as resp:
-        if resp.status != 200:
-            return []
-        matches = await resp.json(content_type=None)
-    return matches if isinstance(matches, list) else []
-
-
-def _first_segment(name: str) -> str:
-    return name.split(",")[0].strip().lower()
-
-
-async def _resolve_parent(part: str, session: aiohttp.ClientSession) -> str:
-    """A state/province (or country) code for 'wa', 'washington', 'new york'."""
-    text = part.strip().lower()
-    if not text:
-        return ""
-    if len(text) == 2 and text.isalpha():
-        countries = {row["code"] for row in await _region_list("country", "world", session)}
-        if text.upper() in countries:
-            return text.upper()
-        states = {row["code"] for row in await _region_list("subnational1", "US", session)}
-        if f"US-{text.upper()}" in states:  # a bare 2-letter US state abbreviation
-            return f"US-{text.upper()}"
-        return ""
-    for row in await _region_list("subnational1", "US", session):
-        if row["name"].lower() == text:
-            return row["code"]
-    for match in await _find_regions(text, session):
-        if _first_segment(match["name"]) == text and match["code"].count("-") <= 1:
-            return match["code"]
-    return ""
-
-
-async def _resolve_child(name: str, parent_code: str, session: aiohttp.ClientSession) -> str:
-    """A county/subnational2 code by name within a state."""
-    text = name.strip().lower()
-    children = await _region_list("subnational2", parent_code, session)
-    for row in children:
-        if row["name"].lower() == text:
-            return row["code"]
-    partial = [row for row in children if row["name"].lower().startswith(text)]
-    return partial[0]["code"] if len(partial) == 1 else ""
-
-
-async def resolve_region(text: str, *, session: aiohttp.ClientSession) -> str:
-    """Turn a code or place name into an eBird region code.
-
-    Accepts 'US-WA-033', 'US-WA', 'WA', 'washington', and county-with-state
-    forms like 'king county wa' or 'king county washington'.
+    None means full detail; leaving the option unset gives the brief level.
     """
-    raw = " ".join(text.replace(",", " ").split())
+    if choice is None:
+        return DETAIL_DEFAULT
+    if choice.value == DETAIL_FULL:
+        return None
+    return choice.value
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name, "").strip().lower()
     if not raw:
-        raise ChecklistError("Which region? Give a code (US-WA) or a name (king county wa).")
-    if "-" in raw and _REGION_CODE_RE.fullmatch(raw):
-        code = raw.upper()
-        countries = {row["code"] for row in await _region_list("country", "world", session)}
-        if countries and code.split("-")[0] not in countries:
-            raise ChecklistError(
-                f"“{raw}” isn't a valid eBird region code; codes start with a country "
-                "like US-WA or US-WA-033."
-            )
-        return code
-
-    words = [w for w in raw.lower().split()]
-    trimmed = [w for w in words if w.strip(".") not in _ADMIN_WORDS] or words
-    if len(trimmed) == 1 and len(trimmed[0]) == 2 and trimmed[0].isalpha():
-        code = await _resolve_parent(trimmed[0], session)
-        if code:
-            return code
-    # "<county> <state>": try each split, longest county name last
-    for split in range(1, len(trimmed)):
-        parent = await _resolve_parent(" ".join(trimmed[split:]), session)
-        if not parent:
-            continue
-        child = await _resolve_child(" ".join(trimmed[:split]), parent, session)
-        if child:
-            return child
-
-    # whole-name matches the finder handles badly: it ranks a same-named county
-    # above a state, and never returns countries at all
-    whole = " ".join(trimmed)
-    for row in await _region_list("subnational1", "US", session):
-        if row["name"].lower() == whole:
-            return row["code"]
-    for row in await _region_list("country", "world", session):
-        if row["name"].lower() == whole:
-            return row["code"]
-
-    matches = await _find_regions(raw, session)
-    if matches:
-        query = raw.lower()
-        ranked = sorted(
-            enumerate(matches),
-            key=lambda pair: (_first_segment(pair[1]["name"]) != query,
-                              pair[1]["code"].count("-"), pair[0]),
-        )
-        best = ranked[0][1]
-        if _first_segment(best["name"]) == query:
-            rivals = [
-                m for _, m in ranked[1:]
-                if _first_segment(m["name"]) == query
-                and m["code"].count("-") == best["code"].count("-")
-            ]
-            if rivals:
-                names = "; ".join(m["name"] for m in [best] + rivals[:4])
-                raise ChecklistError(
-                    f"“{raw}” matches several regions; add a state or use a code. "
-                    f"Candidates: {names}"
-                )
-        return best["code"]
-    raise ChecklistError(
-        f"Couldn't find region “{raw}”; use an eBird code (US, US-WA, US-WA-033), "
-        "a name like “washington”, or a county with its state like “king county wa”."
-    )
+        return default
+    return raw not in ("0", "false", "no", "off")
 
 
-async def resolve_region_code(
-    text: str, *, session: aiohttp.ClientSession | None = None
-) -> str:
-    """`resolve_region` for callers that don't already hold a session."""
-    owns_session = session is None
-    if owns_session:
-        session = aiohttp.ClientSession()
-    try:
-        return await resolve_region(text, session=session)
-    except (aiohttp.ClientError, asyncio.TimeoutError) as error:
-        raise ChecklistError(f"Couldn't reach eBird ({error.__class__.__name__}).") from error
-    finally:
-        if owns_session:
-            await session.close()
+# User-installable: the commands travel with your Discord account, so they work
+# in DMs, group DMs, and servers the bot itself hasn't joined. This requires
+# "User Install" to be enabled in the Developer Portal (Installation →
+# Installation Contexts); without it Discord rejects the sync and the bot falls
+# back to guild-install automatically.
+USER_INSTALL = _env_flag("USER_INSTALL", True)
+
+# The context/install API arrived in discord.py 2.4. On anything older the bot
+# still runs; it just registers commands the old way (servers and DMs).
+SCOPE_API = hasattr(app_commands, "AppCommandContext") and hasattr(
+    app_commands, "AppInstallationType"
+)
 
 
-_REGION_NAME_CACHE: dict[str, str] = {}
-
-
-async def region_name(region_code: str, *, session: aiohttp.ClientSession) -> str:
-    """"Washington, United States" for US-WA; the code itself if eBird won't say."""
-    if region_code in _REGION_NAME_CACHE:
-        return _REGION_NAME_CACHE[region_code]
-    name = region_code
-    try:
-        async with session.get(
-            REGION_INFO_URL.format(region_code=region_code),
-            params={"key": EBIRD_WEB_KEY},
-            headers={"Accept": "application/json", "User-Agent": USER_AGENT},
-            timeout=aiohttp.ClientTimeout(total=20),
-        ) as resp:
-            if resp.status == 200:
-                payload = await resp.json(content_type=None)
-                if isinstance(payload, dict) and payload.get("result"):
-                    name = str(payload["result"])
-    except (aiohttp.ClientError, asyncio.TimeoutError):
-        pass  # cosmetic; the code reads fine on its own
-    _REGION_NAME_CACHE[region_code] = name
-    return name
-
-
-_REGION_SPECIES_CACHE: dict[str, frozenset[str]] = {}
-
-
-async def _region_species(region_code: str, session: aiohttp.ClientSession) -> frozenset[str]:
-    """Species codes ever recorded in a region (cached per process)."""
-    cached = _REGION_SPECIES_CACHE.get(region_code)
-    if cached is not None:
-        return cached
-    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
-    async with session.get(
-        SPPLIST_URL.format(region_code=region_code), params={"key": EBIRD_WEB_KEY},
-        headers=headers, timeout=aiohttp.ClientTimeout(total=25),
-    ) as resp:
-        if resp.status != 200:
-            raise ChecklistError(
-                f"Unknown region `{region_code}` — use an eBird region code "
-                "(US, US-WA, US-WA-033) or a region name."
-            )
-        codes = await resp.json(content_type=None)
-    result = frozenset(codes) if isinstance(codes, list) else frozenset()
-    _REGION_SPECIES_CACHE[region_code] = result
-    return result
-
-
-_REGION_TAXA_CACHE: dict[str, list[dict]] = {}
-
-
-async def _region_taxa(region_code: str, session: aiohttp.ClientSession) -> list[dict]:
-    """[{code, name}, …] for every species recorded in a region (cached).
-
-    Built from the region's species list plus taxonomy names, because the
-    global fuzzy finder caps at 150 matches in taxonomic order — filtering
-    those by region would wrongly drop late-order families (e.g. warblers).
-    """
-    cached = _REGION_TAXA_CACHE.get(region_code)
-    if cached is not None:
-        return cached
-    codes = sorted(await _region_species(region_code, session))
-    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
-    taxa: list[dict] = []
-    for start in range(0, len(codes), 200):
-        chunk = ",".join(codes[start:start + 200])
-        async with session.get(
-            TAXONOMY_URL, params={"fmt": "json", "species": chunk, "key": EBIRD_WEB_KEY},
-            headers=headers, timeout=aiohttp.ClientTimeout(total=25),
-        ) as resp:
-            if resp.status != 200:
-                raise ChecklistError(
-                    f"Taxonomy lookup returned HTTP {resp.status} — try again in a minute."
-                )
-            rows = await resp.json(content_type=None)
-        for row in rows or []:
-            taxa.append({
-                "code": row.get("speciesCode"),
-                "name": f"{row.get('comName')} - {row.get('sciName')}",
-            })
-    _REGION_TAXA_CACHE[region_code] = taxa
-    return taxa
-
-
-async def resolve_species(
-    query: str, *, session: aiohttp.ClientSession, regional_taxa: list[dict] | None = None
-) -> tuple[str, str]:
-    """Match a common or scientific name to (taxonCode, display name).
-
-    An exact name match wins outright; otherwise a lone hit is used as-is,
-    and multiple hits raise a did-you-mean error rather than silently
-    searching the wrong species. With `regional_taxa`, candidates come from
-    that region's species first, falling back to the global list.
-    """
-    lowered = query.strip().lower()
-    if regional_taxa is not None:
-        by_common = [t for t in regional_taxa if lowered in t["name"].partition(" - ")[0].lower()]
-        by_sci = [t for t in regional_taxa if lowered in t["name"].partition(" - ")[2].lower()]
-        pool = by_common or by_sci
-        if pool:
-            for match in pool:
-                common, _, scientific = match["name"].partition(" - ")
-                if lowered in (common.lower(), scientific.lower()):
-                    return match["code"], match["name"]
-            if len(pool) == 1:
-                return pool[0]["code"], pool[0]["name"]
-            preview = "; ".join(m["name"] for m in pool[:5])
-            raise ChecklistError(
-                f"“{query}” matches {len(pool)} species in that region — use a more "
-                f"exact name, or set `group:True`. Closest matches: {preview} …"
-            )
-        # nothing in the region matched the text; fall back to the global list
-    matches = await _find_taxa(query, session)
-    if not matches:
-        raise ChecklistError(
-            f"No species matched “{query}” — try the exact common or scientific name."
-        )
-    for match in matches:
-        common, _, scientific = match["name"].partition(" - ")
-        if lowered in (common.lower(), scientific.lower()):
-            return match["code"], match["name"]
-    if len(matches) == 1:
-        return matches[0]["code"], matches[0]["name"]
-    more = "+" if len(matches) == 25 else ""
-    preview = "; ".join(m["name"] for m in matches[:5])
-    raise ChecklistError(
-        f"“{query}” matches {len(matches)}{more} species — use a more exact name, "
-        "or set `group:True` to search everything matching it in their library. "
-        f"Closest matches: {preview} …"
-    )
-
-
-async def _paged_user_search(
-    session: aiohttp.ClientSession, user_id: str, *, sort: str, media_type: str = "photo",
-    region_code: str = "",
-) -> list[dict]:
-    """Page through a user's media in server sort order, up to MAX_PHOTOS items.
-
-    `media_type` is photo/audio/video, or empty for every kind."""
-    items: list[dict] = []
-    cursor: str | None = None
-    while len(items) < MAX_PHOTOS:
-        params: dict = {"userId": user_id, "sort": sort, "count": PAGE_SIZE, "unconfirmed": "incl"}
-        if media_type:
-            params["mediaType"] = media_type
-        if region_code:
-            params["regionCode"] = region_code
-        if cursor:
-            params["initialCursorMark"] = cursor
-        page = await _search(session, **params)
-        items.extend(page)
-        if len(page) < PAGE_SIZE:
-            break
-        cursor = page[-1].get("cursorMark")
-        if not cursor:
-            break
-    return items[:MAX_PHOTOS]
-
-
-async def fetch_user_details(
-    user_ref: str,
-    *,
-    count: int = 10,
-    include_exif: bool = True,
-    sort: str = SORT_BEST,
-    species_query: str | None = None,
-    species_group: bool = False,
-    media_type: str = "photo",
-    region: str = "",
-    session: aiohttp.ClientSession | None = None,
-) -> UserMedia:
-    """A user's public media, ranked by `sort`, optionally one species only.
-
-    `media_type` is photo/audio/video, or empty for every kind. With
-    `species_group`, `species_query` is a name substring matched against every
-    species in the user's library (their most recent/best MAX_PHOTOS items)
-    instead of one resolved taxon. EXIF fetches are skipped when the caller
-    won't show camera fields.
-    """
-    owns_session = session is None
-    if owns_session:
-        session = aiohttp.ClientSession()
-    try:
-        user_id = ""
-        if user_ref:
-            user_id = await resolve_user(user_ref, session=session)
-        elif not species_query:
-            raise ChecklistError("Give me a user, a species, or both.")
-        region_code = ""
-        regional_taxa: list[dict] | None = None
-        if region:
-            region_code = await resolve_region(region, session=session)
-            regional_taxa = await _region_taxa(region_code, session)
-        species_code = species_display = ""
-        if species_query and species_group and user_id:
-            needle = species_query.strip().lower()
-            species_display = f"“{species_query.strip()}”"
-            everything = await _paged_user_search(
-                session, user_id, sort=sort, media_type=media_type, region_code=region_code
-            )
-            # prefer common-name matches so "puffin" doesn't drag in Puffinus shearwaters
-            by_common = [
-                item for item in everything
-                if needle in ((item.get("taxonomy") or {}).get("comName") or "").lower()
-            ]
-            by_sci = [
-                item for item in everything
-                if needle in ((item.get("taxonomy") or {}).get("sciName") or "").lower()
-            ]
-            items = (by_common or by_sci)[:count]
-        elif species_query and species_group:
-            # global group: one query per matched species, merged and re-ranked
-            needle = species_query.strip().lower()
-            if regional_taxa is not None:
-                candidates = regional_taxa
-            else:
-                candidates = await _find_taxa(species_query, session, cat="species,spuh", limit=150)
-                if not candidates:
-                    raise ChecklistError(
-                        f"No species matched “{species_query}” — try the exact common or scientific name."
-                    )
-            # prefer common-name matches so "puffin" doesn't drag in Puffinus shearwaters
-            by_common = [m for m in candidates if needle in m["name"].partition(" - ")[0].lower()]
-            by_sci = [m for m in candidates if needle in m["name"].partition(" - ")[2].lower()]
-            named = by_common or by_sci
-            if not named:
-                if regional_taxa is not None:
-                    raise ChecklistError(
-                        f"No species matching “{species_query}” has been recorded in `{region_code}`."
-                    )
-                named = candidates
-            if len(named) > GROUP_GLOBAL_MAX:
-                more = "+" if len(candidates) == 150 else ""
-                raise ChecklistError(
-                    f"“{species_query}” is too broad for a group search here "
-                    f"({len(named)}{more} taxa match) — add a user, narrow the group, "
-                    "or use a smaller region."
-                )
-            species_display = f"“{species_query.strip()}” ({len(named)} taxa)"
-            semaphore = asyncio.Semaphore(4)
-
-            async def one_taxon(code: str) -> list[dict]:
-                async with semaphore:
-                    params: dict = {"sort": sort, "count": count, "unconfirmed": "incl", "taxonCode": code}
-                    if media_type:
-                        params["mediaType"] = media_type
-                    if region_code:
-                        params["regionCode"] = region_code
-                    return await _search(session, **params)
-
-            pages = await asyncio.gather(*(one_taxon(m["code"]) for m in named))
-            merged = [item for page in pages for item in page]
-            merged.sort(key=_merge_key(sort), reverse=True)
-            items = merged[:count]
-        else:
-            if species_query:
-                species_code, species_display = await resolve_species(
-                    species_query, session=session, regional_taxa=regional_taxa
-                )
-            params: dict = {"sort": sort, "count": count, "unconfirmed": "incl"}
-            if user_id:
-                params["userId"] = user_id
-            if media_type:
-                params["mediaType"] = media_type
-            if species_code:
-                params["taxonCode"] = species_code
-            if region_code:
-                params["regionCode"] = region_code
-            items = (await _search(session, **params))[:count]
-        if region_code and species_display:
-            species_display += f" in {region_code}"
-        if include_exif and items:
-            semaphore = asyncio.Semaphore(4)
-
-            async def grab(item: dict) -> tuple[tuple[str, str], ...]:
-                async with semaphore:
-                    return await _fetch_exif(session, item["assetId"])
-
-            exifs = await asyncio.gather(*(grab(item) for item in items))
-        else:
-            exifs = [()] * len(items)
-        name = ""
-        if user_id:
-            name = (items[0].get("userDisplayName") if items else "") or user_id
-        return UserMedia(
-            display_name=name,
-            user_id=user_id,
-            species_code=species_code,
-            species_display=species_display,
-            details=[_item_to_details(i, e) for i, e in zip(items, exifs)],
-            region=region_code,
-        )
-    except (aiohttp.ClientError, asyncio.TimeoutError) as error:
-        raise ChecklistError(f"Couldn't reach Macaulay Library ({error.__class__.__name__}).") from error
-    finally:
-        if owns_session:
-            await session.close()
-
-
-def extract_flags(tokens: list[str]) -> tuple[set[str], list[str]]:
-    """Split recognized flags (-vvv, -c, -cc, -ccc) out of user-supplied tokens."""
-    present = {token for token in tokens if token in FLAGS}
-    rest = [token for token in tokens if token not in FLAGS]
-    return present, rest
-
-
-def pick_compact_flag(flags: set[str]) -> str | None:
-    """The compact-family flag to honor; the most-compact one wins if several."""
-    for flag in (COMPACT_FLAG, COMPACT_BRIEF_FLAG, COMPACT_CAMERA_FLAG):
-        if flag in flags:
-            return flag
-    return None
-
-
-def select_fields(details: AssetDetails, flag: str) -> list[tuple[str, str, bool]]:
-    """(label, value, is_camera) rows for a partial-compact selection, skipping absent data."""
-    base = dict(details.photo.metadata_fields(markdown=False))
-    camera = dict(details.exif)
-    rows = []
-    for source, label in COMPACT_SELECTIONS.get(flag, ()):
-        value = (camera if source == "camera" else base).get(label)
-        if value:
-            rows.append((label, value, source == "camera"))
-    return rows
-
-
-def parse_checklist_id(text: str) -> str:
-    """Accept a bare ID (S378216909) or any eBird checklist URL containing one."""
-    match = _CHECKLIST_RE.search(text)
-    if not match:
-        raise ChecklistError(
-            "Couldn't find a checklist ID in that. Pass an ID like `S378216909` "
-            "or a URL like `https://ebird.org/checklist/S378216909`."
-        )
-    return f"S{match.group(1)}"
-
-
-def _summarize_age_sex(age_sex: dict) -> str:
-    parts = []
-    for key, count in age_sex.items():
-        if not count:
-            continue
-        match = _AGE_SEX_RE.fullmatch(key)
-        if not match:
-            continue
-        age, sex = match.group(1), match.group(2).lower()
-        words = [word for word in (age, sex) if word != "unknown"]
-        parts.append(f"{count} {' '.join(words) or 'unreported'}")
-    return " · ".join(parts)
-
-
-def _format_obs_time(raw) -> str:
-    if isinstance(raw, int) and raw > 0:
-        return f"{raw // 100:02d}:{raw % 100:02d}"
-    return ""
-
-
-def _to_photo(item: dict) -> Photo:
-    taxonomy = item.get("taxonomy") or {}
-    location = item.get("location") or {}
-    place_bits = [location.get("name"), location.get("subnational1Name"), location.get("countryName")]
-    tags = item.get("tags")
-    if isinstance(tags, list):
-        tags = ", ".join(str(tag) for tag in tags)
-    return Photo(
-        asset_id=item["assetId"],
-        common_name=taxonomy.get("comName") or taxonomy.get("sciName") or "Unknown species",
-        sci_name=taxonomy.get("sciName") or "",
-        photographer=item.get("userDisplayName") or "Unknown photographer",
-        obs_date=item.get("obsDtDisplay") or "",
-        location=", ".join(bit for bit in place_bits if bit),
-        rating=item.get("rating"),
-        unconfirmed=item.get("valid") is False,
-        rating_count=item.get("ratingCount"),
-        species_code=taxonomy.get("speciesCode") or "",
-        license_id=item.get("licenseId") or "",
-        width=item.get("width"),
-        height=item.get("height"),
-        latitude=location.get("latitude"),
-        longitude=location.get("longitude"),
-        media_type=item.get("mediaType") or "photo",
-        obs_time=_format_obs_time(item.get("obsTime")),
-        age_sex=_summarize_age_sex(item.get("ageSex") or {}),
-        notes="; ".join(bit for bit in (item.get("caption"), item.get("mediaNotes")) if bit),
-        tags=tags or "",
-        user_id=item.get("userId") or "",
-    )
-
-
-def _group_by_species(photos: list[Photo]) -> list[Photo]:
-    """Keep species in first-seen order, but make each species' photos consecutive."""
-    order: dict[str, int] = {}
-    for photo in photos:
-        order.setdefault(photo.common_name, len(order))
-    return sorted(photos, key=lambda photo: order[photo.common_name])
-
-
-async def fetch_checklist_photos(
-    sub_id: str, *, session: aiohttp.ClientSession | None = None
-) -> list[Photo]:
-    """Return every public media item on the checklist (photos, audio, video),
-    grouped by species."""
-    owns_session = session is None
-    if owns_session:
-        session = aiohttp.ClientSession()
-    try:
-        items: list[dict] = []
-        cursor: str | None = None
-        while len(items) < MAX_PHOTOS:
-            # unconfirmed=incl keeps rarities that are still pending review,
-            # which the search index otherwise omits
-            params = {
-                "subId": sub_id,
-                "count": str(PAGE_SIZE),
-                "unconfirmed": "incl",
-            }
-            if cursor:
-                params["initialCursorMark"] = cursor
-            page = await _search(session, **params)
-            items.extend(page)
-            if len(page) < PAGE_SIZE:
-                break
-            cursor = page[-1].get("cursorMark")
-            if not cursor:
-                break
-    except (aiohttp.ClientError, asyncio.TimeoutError) as error:
-        raise ChecklistError(f"Couldn't reach Macaulay Library ({error.__class__.__name__}).") from error
-    finally:
-        if owns_session:
-            await session.close()
-    return _group_by_species([_to_photo(item) for item in items[:MAX_PHOTOS]])
-
-
-# (scope, "MM-DD") -> season baseline; today's date is part of the key, so a
-# long-running bot naturally refreshes as the season moves
-_SEASON_CACHE: dict[tuple[str, str], dict] = {}
-
-
-def _season_day(year: int, month: int, day: int, offset: int) -> date:
-    """The anchor date shifted into another year, tolerating Feb 29."""
-    while True:
-        try:
-            return date(year, month, day) + timedelta(days=offset)
-        except ValueError:
-            day -= 1
-
-
-async def _get_json(url: str, session: aiohttp.ClientSession):
-    try:
-        async with session.get(
-            url, params={"key": EBIRD_WEB_KEY},
-            headers={"Accept": "application/json", "User-Agent": USER_AGENT},
-            timeout=aiohttp.ClientTimeout(total=20),
-        ) as resp:
-            if resp.status == 200:
-                return await resp.json(content_type=None)
-    except (aiohttp.ClientError, asyncio.TimeoutError):
-        pass  # rarity is a nice-to-have; a failure just means "unknown"
-    return None
-
-
-async def _fetch_season_baseline(scope: str, session: aiohttp.ClientSession) -> dict:
-    """Which species were reported in `scope` around this date in prior years.
-
-    Samples RARITY_OFFSETS days around today's month/day in each of the prior
-    RARITY_YEARS years (~30 past days) and records, per species, how many of
-    those days it was reported on (reviewer-accepted records only). Daily
-    checklist totals ride along so callers can judge whether there was enough
-    birding effort here for the answer to mean anything.
-    """
-    anchor = date.today()
-    key = (scope, f"{anchor.month:02d}-{anchor.day:02d}")
-    cached = _SEASON_CACHE.get(key)
-    if cached is not None:
-        return cached
-    if len(_SEASON_CACHE) > 32:
-        _SEASON_CACHE.clear()  # cheap bound; entries go stale daily anyway
-
-    years = range(anchor.year - RARITY_YEARS, anchor.year)
-    days = [
-        _season_day(year, anchor.month, anchor.day, offset)
-        for year in years
-        for offset in RARITY_OFFSETS
-    ]
-    semaphore = asyncio.Semaphore(6)
-
-    async def species_on(day: date):
-        async with semaphore:
-            return await _get_json(
-                HISTORIC_URL.format(region_code=scope, y=day.year, m=day.month, d=day.day),
-                session,
-            )
-
-    async def checklists_on(day: date):
-        async with semaphore:
-            stats = await _get_json(
-                DAY_STATS_URL.format(region_code=scope, y=day.year, m=day.month, d=day.day),
-                session,
-            )
-            return (stats or {}).get("numChecklists") or 0
-
-    day_lists = await asyncio.gather(*(species_on(day) for day in days))
-    # effort is gauged on the anchor day of each year: one stats call per year
-    effort = await asyncio.gather(
-        *(checklists_on(_season_day(year, anchor.month, anchor.day, 0)) for year in years)
-    )
-
-    day_counts: dict[str, int] = {}
-    sampled = 0
-    for observations in day_lists:
-        if observations is None:
-            continue  # fetch failed; don't count the day as sampled
-        sampled += 1
-        for code in {o.get("speciesCode") for o in observations if isinstance(o, dict)}:
-            if code:
-                day_counts[code] = day_counts.get(code, 0) + 1
-    window_start = _season_day(anchor.year, anchor.month, anchor.day, min(RARITY_OFFSETS))
-    window_end = _season_day(anchor.year, anchor.month, anchor.day, max(RARITY_OFFSETS))
-    baseline = {
-        "days": day_counts,
-        "sampled": sampled,
-        "since": years[0],
-        "scope": scope,
-        "checklists": sum(effort),
-        "season": (
-            f"{window_start.strftime('%b')} {window_start.day}-"
-            f"{window_end.strftime('%b')} {window_end.day}"
+def command_scopes(user_install: bool):
+    """(where commands may run, how the app may be installed) for a global sync."""
+    if not SCOPE_API:
+        return None, None
+    return (
+        app_commands.AppCommandContext(
+            guild=True, dm_channel=True, private_channel=user_install
         ),
-        "years": f"{years[0]}-{years[-1]}",
-    }
-    _SEASON_CACHE[key] = baseline
-    return baseline
-
-
-async def _season_baseline(region_code: str, session: aiohttp.ClientSession) -> dict:
-    """The season baseline at the queried scale, escalating only when birding
-    effort there is too thin to rank against (and saying so via 'scope')."""
-    scope = region_code
-    while True:
-        baseline = await _fetch_season_baseline(scope, session)
-        enough = baseline["sampled"] and baseline["checklists"] >= RARITY_MIN_EFFORT
-        if enough or "-" not in scope:
-            return baseline
-        scope = scope.rsplit("-", 1)[0]  # county -> state -> country
-
-
-async def _warm_rarity_baseline(region_code: str, session: aiohttp.ClientSession) -> None:
-    """Build the region's season baseline once, so parallel lookups hit the cache."""
-    await _season_baseline(region_code, session)
-
-
-async def _rarity(
-    region_code: str, species_code: str, session: aiohttp.ClientSession
-) -> tuple[str, str, float | None, str]:
-    """(label, emoji, share, note): how often this species is reported here in season.
-
-    Frequency of reviewer-accepted reports, at the scale actually queried
-    (a county ranks against itself when it has real coverage), in this
-    season across prior years; eBird's own kind of measure.
-    """
-    baseline = await _season_baseline(region_code, session)
-    sampled = baseline["sampled"]
-    if not sampled:
-        return "Notable sighting", "⚪", None, ""
-    mine = baseline["days"].get(species_code, 0)
-    share = 100 * mine / sampled
-    # each sampled day the species appeared carries at least one accepted
-    # record, so the day count is a floor on confirmed reports; "+" says so
-    count = f"{mine}+ confirmed reports" if mine else "no confirmed reports"
-    note = (
-        f"{count} during {baseline['season']}, {baseline['years']},"
-        f" in {baseline['scope']}"
+        app_commands.AppInstallationType(guild=True, user=user_install),
     )
-    for threshold, label, emoji in RARITY_TIERS:
-        if share < threshold:
-            return label, emoji, share, note
-    return "Locally notable", "⚪", share, note
 
 
-species_rarity = _rarity  # public name for callers outside this module
-
-
-def notable_key(obs: dict) -> str:
-    """One species on one checklist — the identity of a single rare-bird report."""
-    return f"{obs.get('subId') or ''}:{obs.get('speciesCode') or ''}"
-
-
-def notable_status(obs: dict) -> str:
-    """Where eBird's review stands on a flagged record.
-
-    Flagged observations enter the feed unreviewed (`obsValid` false,
-    `obsReviewed` false) and flip to valid once a regional reviewer accepts
-    them; reviewed-but-invalid means the record was not accepted.
-    """
-    if obs.get("obsValid"):
-        return STATUS_CONFIRMED
-    return STATUS_REJECTED if obs.get("obsReviewed") else STATUS_PENDING
-
-
-async def fetch_notable(
-    region_code: str,
-    *,
-    days: int = 14,
-    session: aiohttp.ClientSession | None = None,
-    max_age: float = NOTABLE_CACHE_SECONDS,
-) -> list[dict]:
-    """Raw notable-sightings feed for an already-resolved region code.
-
-    Includes records at every review stage; use `notable_status` to tell them
-    apart. `days` is capped at eBird's 30-day maximum.
-
-    Every result is cached briefly and shared by all callers, so a region
-    watched by several subscribers, or looked up by `/rare` just after a poll,
-    costs one request rather than one per caller. Pass `max_age=0` to insist
-    on fresh data, as the alert poll does.
-    """
-    days = max(1, min(days, NOTABLE_MAX_DAYS))
-    key = (region_code.upper(), days)
-    now = time.monotonic()
-    for stale, (fetched_at, _) in list(_NOTABLE_CACHE.items()):
-        if now - fetched_at > NOTABLE_CACHE_SECONDS:
-            del _NOTABLE_CACHE[stale]  # feeds are large; don't hoard them
-    cached = _NOTABLE_CACHE.get(key)
-    if cached is not None and max_age > 0 and now - cached[0] <= max_age:
-        return cached[1]
-
-    owns_session = session is None
-    if owns_session:
-        session = aiohttp.ClientSession()
+def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
+    raw = os.getenv(name, "")
     try:
-        async with session.get(
-            NOTABLE_URL.format(region_code=region_code),
-            params={"key": EBIRD_WEB_KEY, "back": str(days), "detail": "full"},
-            headers={"Accept": "application/json", "User-Agent": USER_AGENT},
-            timeout=aiohttp.ClientTimeout(total=30),
-        ) as resp:
-            if resp.status != 200:
-                raise ChecklistError(
-                    f"eBird returned HTTP {resp.status} for notable sightings in "
-                    f"`{region_code}` — check the region."
-                )
-            observations = await resp.json(content_type=None)
-    except (aiohttp.ClientError, asyncio.TimeoutError) as error:
-        raise ChecklistError(f"Couldn't reach eBird ({error.__class__.__name__}).") from error
-    finally:
-        if owns_session:
-            await session.close()
-    if not isinstance(observations, list):
-        raise ChecklistError("Unexpected response from eBird's notable-sightings feed.")
-    _NOTABLE_CACHE[key] = (time.monotonic(), observations)
-    return observations
+        return max(minimum, min(int(raw), maximum)) if raw else default
+    except ValueError:
+        print(f"{name}={raw!r} isn't a number — using {default}.")
+        return default
 
 
-async def _first_photo(
-    obs: dict, session: aiohttp.ClientSession, semaphore: asyncio.Semaphore
-) -> tuple[dict, dict | None]:
-    """The observation paired with its first public photo, or None if it has none."""
-    if not obs.get("hasRichMedia"):
-        return obs, None
-    async with semaphore:
-        page = await _search(
-            session, subId=obs["subId"], taxonCode=obs["speciesCode"],
-            mediaType="photo", count=1, unconfirmed="incl",
-        )
-    return obs, (page[0] if page else None)
+# Rare bird alerts: poll every watched region on this cadence and DM what's new.
+ALERT_INTERVAL_SECONDS = _env_int("ALERT_INTERVAL_SECONDS", 300, 60, 3600)
+# eBird's window is by *observation* date, so it has to be wider than the poll
+# interval: checklists are often submitted hours or days after the sighting.
+ALERT_WINDOW_DAYS = _env_int("ALERT_WINDOW_DAYS", 3, 1, 30)
+ALERT_BUILD_MAX = 40   # most reports to look up per region per poll
+ALERT_DM_MAX = 10      # most DMs to one subscriber per poll
+ALERT_FAILURE_LIMIT = 3  # consecutive DM failures before a subscription pauses
+
+# Everything the bot remembers lives in one SQLite file. Old JSON state files
+# are imported on first start and renamed *.migrated (see db.py).
+HERE = Path(__file__).resolve().parent
+DB = db.connect(HERE / "bot.db")
+
+store = AlertStore(DB, legacy_json=HERE / "subscriptions.json")
+
+# Learned identities: Discord links (via /iam) and display names seen in any
+# command's results, so "@mention" and "Mark Zorthesosen" work as user refs.
+_MENTION_RE = re.compile(r"<@!?(\d+)>")
+_NAMELIKE_RE = re.compile(r"^@?[^\d:/]+$")  # words only: no digits, no URLs
 
 
-async def attach_photos(
-    observations: list[dict], *, session: aiohttp.ClientSession, concurrency: int = 6
-) -> list[tuple[dict, dict | None]]:
-    """Pair every observation with a photo where one is actually indexed."""
-    semaphore = asyncio.Semaphore(concurrency)
-    return list(await asyncio.gather(
-        *(_first_photo(obs, session, semaphore) for obs in observations)
-    ))
-
-
-async def build_rare_reports(
-    region_code: str,
-    selected: list[tuple[dict, dict | None]],
-    *,
-    session: aiohttp.ClientSession,
-    per_species: Counter | None = None,
-    include_exif: bool = False,
-) -> list[RareReport]:
-    """Turn (observation, photo) pairs into reports: camera data, rarity, text."""
-    if not selected:
-        return []
-    if per_species is None:
-        per_species = Counter(obs.get("speciesCode") for obs, _ in selected)
-    if include_exif:
-        exif_sem = asyncio.Semaphore(4)
-
-        async def grab(item: dict | None) -> tuple[tuple[str, str], ...]:
-            if not item:
-                return ()
-            async with exif_sem:
-                return await _fetch_exif(session, item["assetId"])
-
-        exifs = await asyncio.gather(*(grab(item) for _, item in selected))
-    else:
-        exifs = [()] * len(selected)
-
-    await _warm_rarity_baseline(region_code, session)
-    rarity_sem = asyncio.Semaphore(4)
-
-    async def rarity_for(species_code: str):
-        async with rarity_sem:
-            return await _rarity(region_code, species_code, session)
-
-    rarities = await asyncio.gather(*(rarity_for(obs["speciesCode"]) for obs, _ in selected))
-
-    reports = []
-    for (obs, item), exif, (label, emoji, share, note) in zip(selected, exifs, rarities):
-        reports.append(RareReport(
-            common_name=obs.get("comName") or "Unknown species",
-            sci_name=obs.get("sciName") or "",
-            species_code=obs.get("speciesCode") or "",
-            obs_dt=obs.get("obsDt") or "",
-            location=obs.get("locName") or "",
-            observer=obs.get("userDisplayName") or "",
-            checklist_id=obs.get("subId") or "",
-            reports_in_window=per_species.get(obs.get("speciesCode"), 0),
-            rarity_label=label,
-            rarity_emoji=emoji,
-            rarity_share=share,
-            rarity_note=note,
-            details=_item_to_details(item, exif) if item else None,
-            status=notable_status(obs),
-            latitude=obs.get("lat"),
-            longitude=obs.get("lng"),
-            how_many=obs.get("howMany"),
-            county=obs.get("subnational2Name") or "",
-            state=obs.get("subnational1Name") or "",
-        ))
-    return reports
-
-
-async def fetch_rare_reports(
-    region: str,
-    *,
-    count: int = 10,
-    days: int = 14,
-    unique_species: bool = True,
-    include_exif: bool = False,
-    require_photo: bool = True,
-    confirmed_only: bool = False,
-    session: aiohttp.ClientSession | None = None,
-) -> tuple[str, list[RareReport]]:
-    """Recent rarities in a region, most recent first.
-
-    Both reviewer-accepted and still-unreviewed observations are returned
-    (each report carries its `status`); records a reviewer rejected never
-    are. `confirmed_only=True` keeps only accepted ones. By default each
-    report must also have a retrievable public photo; with
-    `require_photo=False` every report is listed, and `details` holds a
-    photo only for those that actually have one.
-    """
-    owns_session = session is None
-    if owns_session:
-        session = aiohttp.ClientSession()
+def _migrate_aliases() -> None:
+    """One-time import of an aliases.json from before the database."""
+    legacy = HERE / "aliases.json"
     try:
-        region_code = await resolve_region(region, session=session)
-        observations = await fetch_notable(region_code, days=days, session=session)
-        per_species = Counter(o.get("speciesCode") for o in observations)
-        # "confirmed" = a regional reviewer accepted the record; hasRichMedia
-        # is eBird's own flag that something was attached (photo, audio or video)
-        wanted = (
-            (lambda o: bool(o.get("obsValid"))) if confirmed_only
-            else (lambda o: notable_status(o) != STATUS_REJECTED)
+        data = json.loads(legacy.read_text(encoding="utf-8"))
+    except OSError:
+        return  # no legacy file: nothing to migrate
+    except ValueError as error:
+        print(f"Ignoring unreadable {legacy.name}: {error}")
+        return
+    links = [
+        (str(key), str(value))
+        for key, value in (data.get("discord") or {}).items() if value
+    ]
+    names = [
+        (str(key), str(entry[0]), str(entry[1]))
+        for key, entry in (data.get("names") or {}).items()
+        if isinstance(entry, (list, tuple)) and len(entry) == 2
+    ]
+    with DB:
+        DB.executemany(
+            "INSERT OR IGNORE INTO discord_links (discord_id, ebird_id) VALUES (?, ?)",
+            links,
         )
-        candidates = [
-            o for o in observations
-            if wanted(o) and (o.get("hasRichMedia") or not require_photo)
-        ]
-        ordered: list[dict] = []
-        seen_reports: set[tuple] = set()
-        seen_species: set[str] = set()
-        for obs in sorted(candidates, key=lambda o: o.get("obsDt") or "", reverse=True):
-            key = (obs.get("subId"), obs.get("speciesCode"))
-            if key in seen_reports:
-                continue
-            seen_reports.add(key)
-            if unique_species:
-                if obs.get("speciesCode") in seen_species:
-                    continue
-                seen_species.add(obs.get("speciesCode"))
-            ordered.append(obs)
-
-        semaphore = asyncio.Semaphore(6)
-
-        # hasRichMedia doesn't guarantee an indexed public photo, so walk the
-        # candidates newest-first and keep the ones that really have one
-        selected: list[tuple[dict, dict | None]] = []
-        if not require_photo:
-            # keep every confirmed report, but still resolve a photo where eBird
-            # flags one, so callers can mark which reports have imagery
-            selected = list(await asyncio.gather(
-                *(_first_photo(o, session, semaphore) for o in ordered[:count])
-            ))
-        else:
-            pool = ordered[:RARE_SCAN_MAX]
-            batch = max(count, 8)
-            for start in range(0, len(pool), batch):
-                if len(selected) >= count:
-                    break
-                for obs, item in await asyncio.gather(
-                    *(_first_photo(o, session, semaphore) for o in pool[start:start + batch])
-                ):
-                    if item is not None and len(selected) < count:
-                        selected.append((obs, item))
-
-        reports = await build_rare_reports(
-            region_code, selected, session=session, per_species=per_species,
-            include_exif=include_exif and require_photo,
+        DB.executemany(
+            "INSERT OR IGNORE INTO names (key, ebird_id, display) VALUES (?, ?, ?)",
+            names,
         )
-        return region_code, reports
-    except (aiohttp.ClientError, asyncio.TimeoutError) as error:
-        raise ChecklistError(f"Couldn't reach eBird ({error.__class__.__name__}).") from error
-    finally:
-        if owns_session:
-            await session.close()
-
-
-async def fetch_alert_reports(
-    region_code: str,
-    *,
-    days: int = 3,
-    limit: int = 25,
-    skip: set[str] | None = None,
-    session: aiohttp.ClientSession | None = None,
-) -> list[RareReport]:
-    """Every flagged report in the window — confirmed *and* awaiting review.
-
-    This is what the alert poller sends: one report per species per checklist,
-    newest first, with a photo attached where one exists. `skip` holds
-    `notable_key`s already delivered, filtered out before any per-report
-    lookups so a quiet poll costs a single request.
-    """
-    owns_session = session is None
-    if owns_session:
-        session = aiohttp.ClientSession()
     try:
-        observations = await fetch_notable(region_code, days=days, session=session)
-        per_species = Counter(o.get("speciesCode") for o in observations)
-        fresh: dict[str, dict] = {}
-        for obs in sorted(observations, key=lambda o: o.get("obsDt") or "", reverse=True):
-            key = notable_key(obs)
-            if notable_status(obs) == STATUS_REJECTED or key in (skip or ()):
-                continue
-            fresh.setdefault(key, obs)
-        selected = await attach_photos(list(fresh.values())[:limit], session=session)
-        return await build_rare_reports(
-            region_code, selected, session=session, per_species=per_species
-        )
-    finally:
-        if owns_session:
-            await session.close()
+        legacy.replace(legacy.with_name(legacy.name + ".migrated"))
+        print(f"Imported {len(links)} link(s) and {len(names)} name(s) from {legacy.name}.")
+    except OSError as error:
+        print(f"Imported {legacy.name} but couldn't rename it afterwards: {error}")
 
 
-async def _main(argv: list[str]) -> int:
-    flags, args = extract_flags(argv)
-    verbose = VERBOSE_FLAG in flags
-    compact_flag = pick_compact_flag(flags)
-    if args and args[0].lower() == "alert":
-        words = [t for t in args[1:] if not t.isdigit()]
-        nums = [int(t) for t in args[1:] if t.isdigit()]
-        if not words:
-            print("usage: python ebird_media.py alert <region> [days] [limit]", file=sys.stderr)
-            return 2
-        region_code = await resolve_region_code(" ".join(words))
-        reports = await fetch_alert_reports(
-            region_code,
-            days=nums[0] if nums else 3,
-            limit=nums[1] if len(nums) > 1 else 25,
-        )
-        print(f"{len(reports)} alertable report(s) in {region_code}")
-        for report in reports:
-            mark = "✅" if report.confirmed else "⏳"
-            photo = f" ML{report.details.photo.asset_id}" if report.details else ""
-            print(f"  {report.obs_dt}  {mark} {report.rarity_emoji} "
-                  f"{report.common_name:<26} {report.rarity_display}{photo}")
-            print(f"      {report.location} · {report.observer} · {report.checklist_url}")
-        return 0
-    if args and args[0].lower() == "rare":
-        rest = args[1:]
-        tokens = ("photos", "confirmed", "text", "nophoto")  # last two: old defaults, now no-ops
-        photo_mode = any(t.lower() == "photos" for t in rest)
-        confirmed_mode = any(t.lower() == "confirmed" for t in rest)
-        words = [t for t in rest if not t.isdigit() and t.lower() not in tokens]
-        nums = [int(t) for t in rest if t.isdigit()]
-        if not words:
-            print(
-                "usage: python ebird_media.py rare <region> [count] [days] [photos] [confirmed]",
-                file=sys.stderr,
+_migrate_aliases()
+
+
+def learn_names(pairs) -> None:
+    """Remember (display name, USER… ID) pairs seen in results."""
+    rows = []
+    for display, user_id in pairs:
+        display = (display or "").strip()
+        if not display or not user_id or display == user_id:
+            continue
+        rows.append((display.lower(), user_id, display))
+    if rows:
+        with DB:
+            DB.executemany(
+                "INSERT INTO names (key, ebird_id, display) VALUES (?, ?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET"
+                " ebird_id = excluded.ebird_id, display = excluded.display",
+                rows,
             )
-            return 2
-        region_code, reports = await fetch_rare_reports(
-            " ".join(words),
-            count=nums[0] if nums else 10,
-            days=nums[1] if len(nums) > 1 else 14,
-            require_photo=photo_mode,
-            confirmed_only=confirmed_mode,
+
+
+def link_discord(discord_id: str, ebird_id: str) -> None:
+    """Remember which eBird account a Discord user is (/iam)."""
+    with DB:
+        DB.execute(
+            "INSERT INTO discord_links (discord_id, ebird_id) VALUES (?, ?)"
+            " ON CONFLICT(discord_id) DO UPDATE SET ebird_id = excluded.ebird_id",
+            (discord_id, ebird_id),
         )
-        kind = "eBird-confirmed rarities" if confirmed_mode else "rarities"
-        qualifier = " with photos" if photo_mode else ""
-        print(f"{len(reports)} {kind}{qualifier} in {region_code}")
-        for report in reports:
-            print(f"  {report.obs_dt}  {report.rarity_emoji} {report.common_name:<26} "
-                  f"{report.rarity_display}")
-            asset = f"ML{report.details.photo.asset_id} · " if report.details else ""
-            print(f"      {asset}{report.location} · {report.observer} · {report.checklist_url}")
-        return 0
-    user_mode = bool(args) and bool(_USER_ID_RE.search(args[0]) or _PROFILE_URL_RE.search(args[0]))
-    if not args or (not user_mode and len(args) != 1):
-        print(
-            "usage: python ebird_media.py [-vvv | -c | -cc | -ccc] "
-            "<checklist URL/ID | ML asset URL/number | USER… ID [count] [top|recent|obs] [species] "
-            "| rare <region> [count] [days]>",
-            file=sys.stderr,
+
+
+def linked_user(interaction: discord.Interaction) -> str:
+    """The eBird ID this Discord account linked with /iam, or "" if none."""
+    row = DB.execute(
+        "SELECT ebird_id FROM discord_links WHERE discord_id = ?",
+        (str(interaction.user.id),),
+    ).fetchone()
+    return row["ebird_id"] if row else ""
+
+
+NO_USER_LINKED = (
+    "Whose photos? Either name someone (their `USER…` ID, an @mention, or one of "
+    "their Macaulay Library asset links), or run `/iam` once with your own ID or "
+    "asset link and then you can leave `user` blank."
+)
+
+
+def resolve_alias(text: str) -> str | None:
+    """Turn a Discord @mention or a learned display name into a USER… ID.
+
+    Returns None when `text` isn't mention/name-shaped and should go to the
+    library resolver (USER IDs, asset links, digits) untouched.
+    """
+    stripped = text.strip()
+    mention = _MENTION_RE.fullmatch(stripped)
+    if mention:
+        row = DB.execute(
+            "SELECT ebird_id FROM discord_links WHERE discord_id = ?",
+            (mention.group(1),),
+        ).fetchone()
+        if row:
+            return row["ebird_id"]
+        raise ChecklistError(
+            "That Discord account isn't linked to an eBird user yet — "
+            "they can link it with `/iam` (USER… ID or one of their ML asset links)."
         )
-        return 2
-    if user_mode:
-        count, sort, group, region = 10, SORT_BEST, False, ""
-        species_words: list[str] = []
-        for token in args[1:]:
-            if token.isdigit():
-                count = int(token)
-            elif token.lower() == "recent":
-                sort = SORT_RECENT
-            elif token.lower() == "obs":
-                sort = SORT_OBS
-            elif token.lower() == "top":
-                sort = SORT_BEST
-            elif token.lower() == "group":
-                group = True
-            elif token.lower().startswith("in:"):
-                region = token[3:]
-            else:
-                species_words.append(token)
+    if not _NAMELIKE_RE.fullmatch(stripped):
+        return None
+    needle = stripped.lstrip("@").strip().lower()
+    exact = DB.execute("SELECT ebird_id FROM names WHERE key = ?", (needle,)).fetchone()
+    if exact:
+        return exact["ebird_id"]
+    hits = {
+        (row["ebird_id"], row["display"])
+        for row in DB.execute("SELECT key, ebird_id, display FROM names")
+        if needle in row["key"]
+    }
+    if len(hits) == 1:
+        return next(iter(hits))[0]
+    if hits:
+        shown = "; ".join(sorted(display for _, display in hits)[:5])
+        raise ChecklistError(f"“{stripped}” matches several people I know — {shown}. Be more specific.")
+    raise ChecklistError(
+        f"I don't recognize “{stripped}” yet. Names are learned automatically — run any "
+        "command once with their `USER…` ID or one of their ML asset links, or have "
+        "them link themselves with `/iam`."
+    )
+
+
+class ChecklistBot(discord.Client):
+    def __init__(self) -> None:
+        super().__init__(intents=discord.Intents.default())
+        self.tree = app_commands.CommandTree(self)
+        self.alert_task: asyncio.Task | None = None
+
+    def _scope(self, contexts, installs) -> None:
+        if not SCOPE_API:
+            return  # older discord.py: leave registration at its defaults
+        for command in self.tree.get_commands():
+            command.allowed_contexts = contexts
+            command.allowed_installs = installs
+
+    async def setup_hook(self) -> None:
+        self.alert_task = self.loop.create_task(alert_loop(), name="rare-bird-alerts")
+        print(f"discord.py {discord.__version__}; user-install API: {SCOPE_API}")
+        try:
+            await self._register_commands()
+        except Exception as error:  # noqa: BLE001 - never crash-loop over registration
+            print(
+                f"Command registration failed ({error!r}). The bot is still running, "
+                "but its commands may be missing or out of date."
+            )
+
+    async def _register_commands(self) -> None:
+        raw = os.getenv("GUILD_ID", "")
+        tokens = [token for token in re.split(r"[,\s]+", raw) if token]
+        if not all(token.isdigit() for token in tokens):
+            print(
+                f"Ignoring GUILD_ID={raw!r}: it must be numeric server IDs, "
+                "comma-separated. Registering globally only."
+            )
+            tokens = []
+        # Guild copies go out first and carry no context/install overrides: those
+        # fields only mean something for global commands, and copy_global_to
+        # shares them with the originals, so they must be synced before we set them.
+        self._scope(None, None)
+        for guild_id in tokens:
+            # Guild copies appear instantly, which is what makes testing bearable.
+            guild = discord.Object(id=int(guild_id))
+            self.tree.copy_global_to(guild=guild)
+            try:
+                await self.tree.sync(guild=guild)
+            except discord.Forbidden:
+                print(
+                    f"Can't register commands in server {guild_id}: the bot either "
+                    "isn't in that server or was invited without the "
+                    "applications.commands scope. Re-invite it with the OAuth URL "
+                    "from the README (scope=bot+applications.commands), then restart."
+                )
+        # Always register globally as well: guild-scoped commands never show up
+        # in DMs, so this is the registration that makes DM and user-install use
+        # possible. It can take up to an hour to propagate the first time.
+        self._scope(*command_scopes(USER_INSTALL))
+        try:
+            await self.tree.sync()
+            where = "servers, DMs, and anywhere you install it" if USER_INSTALL else "servers and DMs"
+            print(f"Commands registered globally for {where}.")
+        except discord.HTTPException as error:
+            if not USER_INSTALL:
+                print(f"Global command sync failed ({error}); DM commands may be unavailable.")
+                return
+            print(
+                f"Global sync with user install failed ({error}). Enable it at "
+                "https://discord.com/developers/applications → your app → Installation → "
+                "Installation Contexts → tick 'User Install', then restart. "
+                "Falling back to guild install for now."
+            )
+            self._scope(*command_scopes(False))
+            try:
+                await self.tree.sync()
+                print("Registered globally without user install; servers and DMs still work.")
+            except discord.HTTPException as retry_error:
+                print(f"Global command sync still failing ({retry_error}).")
+
+
+bot = ChecklistBot()
+
+
+@bot.tree.error
+async def on_command_error(
+    interaction: discord.Interaction, error: app_commands.AppCommandError
+) -> None:
+    """Answer the interaction on any crash, so commands never hang on 'thinking'."""
+    cause = getattr(error, "original", error)
+    name = interaction.command.name if interaction.command else "?"
+    print(f"Command /{name} failed: {cause!r}")
+    traceback.print_exception(type(cause), cause, cause.__traceback__)
+    message = (
+        f"⚠️ `/{name}` hit an internal error ({type(cause).__name__}). "
+        "The full traceback is in the bot's log (`journalctl -u ebird-discord-bot`)."
+    )
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
+    except discord.HTTPException:
+        pass  # the interaction may have expired; the log still has the traceback
+
+
+@bot.event
+async def on_ready() -> None:
+    watching = len(store.active())
+    alerts = (
+        f"{watching} rare bird alert subscription(s), polled every "
+        f"{ALERT_INTERVAL_SECONDS // 60} min"
+        if watching else "no rare bird alert subscriptions yet"
+    )
+    print(f"Logged in as {bot.user} — /checklist is ready; {alerts}")
+
+
+class Delivery:
+    """Where a command's output goes, so results stay out of busy channels.
+
+    Run from a server, results are DMed to whoever asked: that keeps the
+    channel clean and, unlike ephemeral replies, leaves real messages they can
+    forward. Run from a DM, results simply post in place. If the user's DMs are
+    shut, output falls back to dismissable (ephemeral) replies.
+    """
+
+    def __init__(self, interaction: discord.Interaction) -> None:
+        self.interaction = interaction
+        self.mode = "dm" if interaction.guild is not None else "here"
+        self._channel: discord.abc.Messageable | None = None
+
+    @property
+    def private_reply(self) -> bool:
+        return self.interaction.guild is not None
+
+    async def send(self, **kwargs) -> discord.Message:
+        """One message of results; returns it so callers can edit it later."""
+        if self.mode == "dm":
+            try:
+                if self._channel is None:
+                    self._channel = (
+                        self.interaction.user.dm_channel
+                        or await self.interaction.user.create_dm()
+                    )
+                return await self._channel.send(**kwargs)
+            except (discord.Forbidden, discord.HTTPException):
+                self.mode = "ephemeral"  # deliver the rest here instead
+                await self.notice(
+                    "I couldn't DM you, so this is only visible to you here. Turn on "
+                    "Settings → Privacy & Safety → Direct Messages from server members "
+                    "to get results in your DMs, where they stay and can be forwarded."
+                )
+        return await self.interaction.followup.send(
+            ephemeral=self.mode == "ephemeral", **kwargs
+        )
+
+    async def notice(self, text: str) -> None:
+        """A short reply to whoever ran the command, never to the channel."""
+        await self.interaction.followup.send(text, ephemeral=self.private_reply)
+
+    async def finish(self, summary: str) -> None:
+        """Tell the invoker where the results went, once they have gone."""
+        if self.mode == "dm":
+            await self.notice(summary)
+
+
+async def defer_privately(interaction: discord.Interaction) -> Delivery:
+    """Defer without showing anything in the channel, and pick a destination."""
+    await interaction.response.defer(ephemeral=interaction.guild is not None)
+    return Delivery(interaction)
+
+
+def build_embed(
+    photo: Photo, *, verbose: bool = False, checklist_id: str = "", show_rating: bool = False
+) -> discord.Embed:
+    lines = []
+    if photo.sci_name:
+        lines.append(f"*{photo.sci_name}*")
+    if photo.type_label:  # audio plays, and video plays in full, at the link
+        lines.append(f"{photo.type_label} · listen/watch at the link")
+    lines.append(f"[macaulaylibrary.org/asset/{photo.asset_id}]({photo.asset_url})")
+    if checklist_id:
+        lines.append(f"[ebird.org/checklist/{checklist_id}](https://ebird.org/checklist/{checklist_id})")
+    if show_rating and photo.rating_display:
+        lines.append(f"⭐ {photo.rating_display}")
+    if photo.unconfirmed:
+        lines.append("⚠️ *Unconfirmed — pending eBird review*")
+    embed = discord.Embed(
+        title=photo.common_name,
+        url=photo.asset_url,
+        description="\n".join(lines),
+        color=EMBED_COLOR,
+    )
+    if photo.has_image:  # the CDN serves stills for photos and video posters
+        embed.set_image(url=photo.image_url(1200))
+    embed.set_footer(text=f"ML{photo.asset_id} • © {photo.photographer} • Macaulay Library")
+    if verbose:
+        for label, value in photo.metadata_fields():
+            if len(value) > FIELD_VALUE_MAX:
+                value = value[:FIELD_VALUE_MAX - 1] + "…"
+            embed.add_field(name=label, value=value, inline=True)
+    return embed
+
+
+GALLERY_MAX = 4  # Discord merges at most four same-url embeds into one card
+
+
+def group_by_species(photos: list[Photo]) -> list[list[Photo]]:
+    """Consecutive runs of one species; fetch order already keeps them together."""
+    groups: list[list[Photo]] = []
+    for photo in photos:
+        if groups and groups[-1][0].common_name == photo.common_name:
+            groups[-1].append(photo)
+        else:
+            groups.append([photo])
+    return groups
+
+
+def build_photo_embed(photo: Photo, *, detail: str | None = None) -> discord.Embed:
+    """A checklist photo card at the chosen detail level.
+
+    Checklist photos carry no EXIF (that would need a page fetch per asset), so
+    the camera rows of the Camera and Brief levels have nothing to fill in and
+    those levels show only when and where.
+    """
+    embed = build_embed(photo, verbose=detail is None, show_rating=True)
+    if detail:
+        stand_in = AssetDetails(photo=photo, media_type=photo.media_type, checklist_id="", exif=())
+        for label, value, is_camera in select_fields(stand_in, detail):
+            embed.add_field(
+                name=f"📷 {label}" if is_camera else label,
+                value=value[:FIELD_VALUE_MAX],
+                inline=True,
+            )
+    return embed
+
+
+def build_species_messages(
+    items: list[Photo], *, detail: str | None = None
+) -> list[tuple[list[discord.Embed], list[str]]]:
+    """(embeds, direct file urls) batches for one species.
+
+    Photo embeds that share a `url` are rendered by Discord as a single card
+    with a grid of images, so a species' photos become one card instead of one
+    embed each; only the first contributes metadata. Audio and video items
+    can't ride in an image grid, so each gets its own embed after the photos,
+    paired with its direct file url so the caller can offer an inline player.
+    Beyond four photos the species spills into further gallery cards.
+    """
+    photos = [item for item in items if item.media_type == "photo"]
+    other = [item for item in items if item.media_type != "photo"]
+    messages: list[tuple[list[discord.Embed], list[str]]] = []
+    for start in range(0, len(photos), GALLERY_MAX):
+        batch = photos[start:start + GALLERY_MAX]
+        anchor = batch[0].asset_url  # the shared url is what triggers the merge
+        if start == 0:
+            lead = build_photo_embed(batch[0], detail=detail)
+            if len(photos) > 1:
+                lead.set_footer(text=f"{lead.footer.text} • {len(photos)} photos")
+        else:
+            lead = discord.Embed(color=EMBED_COLOR)
+            lead.set_image(url=batch[0].image_url(1200))
+        lead.url = anchor
+        embeds = [lead]
+        for photo in batch[1:]:
+            extra = discord.Embed(url=anchor, color=EMBED_COLOR)
+            extra.set_image(url=photo.image_url(1200))
+            embeds.append(extra)
+        messages.append((embeds, []))
+    # audio/video: metadata comes from the item itself, one embed each
+    for item in other:
+        messages.append(
+            ([build_photo_embed(item, detail=detail)],
+             [item.media_url] if item.media_url else [])
+        )
+    return messages
+
+
+@bot.tree.command(
+    name="checklist",
+    description="Post all public Macaulay Library media from an eBird checklist",
+)
+@app_commands.describe(
+    checklist="Checklist URL or ID, e.g. S378216909",
+    detail=DETAIL_HELP,
+)
+@app_commands.choices(detail=DETAIL_CHOICES)
+async def checklist_command(
+    interaction: discord.Interaction,
+    checklist: str,
+    detail: app_commands.Choice[str] | None = None,
+) -> None:
+    delivery = await defer_privately(interaction)
+    flag = detail_flag(detail)
+    try:
+        sub_id = parse_checklist_id(checklist)
+        photos = await fetch_checklist_photos(sub_id)
+    except ChecklistError as error:
+        await delivery.notice(str(error))
+        return
+
+    checklist_url = f"https://ebird.org/checklist/{sub_id}"
+    if not photos:
+        await delivery.notice(
+            f"No public media found on <{checklist_url}> — the checklist may be "
+            "private, have no media yet, or the ID may be wrong."
+        )
+        return
+
+    learn_names((photo.photographer, photo.user_id) for photo in photos)
+    species_count = len({photo.common_name for photo in photos})
+    first = photos[0]
+    detail_bits = [bit for bit in (first.photographer, first.obs_date, first.location) if bit]
+    counts = Counter(photo.media_type for photo in photos)
+    if set(counts) == {"photo"}:
+        what = f"{len(photos)} public photo{'s' if len(photos) != 1 else ''}"
+    else:
+        breakdown = ", ".join(
+            f"{counts[kind]} {label}" for kind, label in
+            (("photo", "photos"), ("audio", "audio"), ("video", "video"))
+            if counts.get(kind)
+        )
+        what = f"{len(photos)} public media items ({breakdown})"
+    header = (
+        f"**{what}** · {species_count} species · {' · '.join(detail_bits)}\n<{checklist_url}>"
+    )
+    if len(photos) > MAX_PHOTOS_POSTED:
+        header += f"\n…showing the first {MAX_PHOTOS_POSTED} items; the rest are at the link"
+
+    # one page per species: its photos ride along as gallery cards on that
+    # page, with audio/video file links in the content for inline players
+    pages: list[list[discord.Embed]] = []
+    page_urls: list[list[str]] = []
+    posted = 0
+    for group in group_by_species(photos):
+        if posted >= MAX_PHOTOS_POSTED:
+            break
+        allowed = group[:MAX_PHOTOS_POSTED - posted]
+        page: list[discord.Embed] = []
+        urls: list[str] = []
+        for embeds, file_urls in build_species_messages(allowed, detail=flag):
+            if page and len(page) + len(embeds) > EMBEDS_PER_MESSAGE:
+                pages.append(page)  # a species with very many items spills over
+                page_urls.append(urls)
+                page, urls = [], []
+            page.extend(embeds)
+            urls.extend(file_urls)
+        if page:
+            pages.append(page)
+            page_urls.append(urls)
+        posted += len(allowed)
+
+    # at most 3 players per page: link unfurls share the 10-embed message cap
+    contents = [
+        header + ("\n" + "\n".join(urls[:3]) if urls else "")
+        for urls in page_urls
+    ]
+    if len(pages) == 1:
+        await delivery.send(content=contents[0], embeds=pages[0])
+    else:
+        pager = EmbedPager(pages, interaction.user.id, contents=contents)
+        pager.message = await delivery.send(content=contents[0], embeds=pages[0], view=pager)
+    await delivery.finish(
+        f"Sent {posted} photo(s) from `{sub_id}` to your DMs"
+        + (" as one paged message." if len(pages) > 1 else ".")
+    )
+
+
+@bot.tree.command(
+    name="checkmedia",
+    description="Post one Macaulay Library asset (photo, audio, or video) with all its metadata",
+)
+@app_commands.describe(
+    media="Macaulay Library asset link or ML number, e.g. ML662698120",
+    detail=DETAIL_HELP,
+)
+@app_commands.choices(detail=DETAIL_CHOICES)
+async def checkmedia_command(
+    interaction: discord.Interaction,
+    media: str,
+    detail: app_commands.Choice[str] | None = None,
+) -> None:
+    await interaction.response.defer()
+    compact_flag = detail_flag(detail)
+    try:
+        asset_id = parse_asset_id(media)
+        details = await fetch_asset_details(asset_id)
+    except ChecklistError as error:
+        await interaction.followup.send(str(error))
+        return
+
+    learn_names([(details.photo.photographer, details.photo.user_id)])
+    # a bare direct-file link makes Discord attach its own inline player
+    await interaction.followup.send(
+        content=details.photo.media_url or None,
+        embed=build_asset_embed(details, compact_flag),
+    )
+
+
+def build_asset_embed(details: AssetDetails, compact_flag: str | None) -> discord.Embed:
+    """The /checkmedia-style embed for one asset, honoring the compact flags."""
+    # build_embed knows the media type: photos and video posters get an image,
+    # audio gets a labeled link instead
+    if compact_flag:
+        embed = build_embed(details.photo, checklist_id=details.checklist_id, show_rating=True)
+        for label, value, is_camera in select_fields(details, compact_flag):
+            name = f"📷 {label}" if is_camera else label
+            embed.add_field(name=name, value=value[:1024], inline=True)
+        return embed
+
+    embed = build_embed(details.photo, verbose=True)
+    if details.checklist_id:
+        embed.add_field(
+            name="Checklist",
+            value=f"[{details.checklist_id}](https://ebird.org/checklist/{details.checklist_id})",
+            inline=True,
+        )
+    if details.exif:
+        for label, value in details.exif:
+            if len(embed.fields) >= 25:  # Discord's per-embed field limit
+                break
+            embed.add_field(name=f"📷 {label}", value=value[:1024], inline=True)
+    else:
+        embed.add_field(name="📷 Camera metadata", value="None available for this asset", inline=False)
+    return embed
+
+
+MEDIA_CHOICES = [
+    app_commands.Choice(name="Photos", value="photo"),
+    app_commands.Choice(name="Audio", value="audio"),
+    app_commands.Choice(name="Video", value="video"),
+    app_commands.Choice(name="All media", value="all"),
+]
+MEDIA_WORDS = {"photo": "photos", "audio": "audio recordings", "video": "videos", "": "media"}
+
+
+def media_value(choice: app_commands.Choice[str] | None, default: str) -> str:
+    """The mediaType the API expects; empty string means every kind."""
+    value = choice.value if choice else default
+    return "" if value == "all" else value
+
+
+async def _send_user_photos(
+    interaction: discord.Interaction,
+    user: str,
+    count: int,
+    sort: str,
+    header: str,
+    species: str = "",
+    species_group: bool = False,
+    region: str = "",
+    media_type: str = "photo",
+    compact_flag: str | None = None,
+    delivery: Delivery | None = None,
+) -> None:
+    """Shared body of /top, /recent, /sp; `header` is formatted with n and sp."""
+    delivery = delivery or Delivery(interaction)
+    try:
+        user_ref = user.strip()
+        user_ref = resolve_alias(user_ref) or user_ref
         result = await fetch_user_details(
-            args[0], count=count, sort=sort, include_exif=False,
-            species_query=" ".join(species_words) or None,
-            species_group=group,
-            media_type="" if species_words else "photo",
+            user_ref, count=count, sort=sort,
+            include_exif=compact_flag != COMPACT_FLAG,
+            species_query=species or None,
+            species_group=species_group,
+            media_type=media_type,
             region=region,
         )
-        kind = {
-            SORT_RECENT: "most recently uploaded",
-            SORT_OBS: "most recent by observation date",
-        }.get(sort, "top rated")
-        of_species = f" of {result.species_display}" if result.species_display else ""
-        print(f"{len(result.details)} {kind} media{of_species} by {result.display_name} ({result.user_id})")
-        for details in result.details:
-            photo = details.photo
-            flag = "  [UNCONFIRMED]" if photo.unconfirmed else ""
-            kind_note = f"  ({details.media_type})" if details.media_type != "photo" else ""
-            print(f"  ML{photo.asset_id}  {photo.common_name:<28} {photo.rating_display:<12} {photo.asset_url}{kind_note}{flag}")
-        return 0
-    if _ASSET_URL_RE.search(args[0]) or _ASSET_ML_RE.search(args[0]):
-        details = await fetch_asset_details(parse_asset_id(args[0]))
-        photo = details.photo
-        flag = "  [UNCONFIRMED]" if photo.unconfirmed else ""
-        print(f"ML{photo.asset_id}  {photo.common_name}  ({details.media_type}){flag}  {photo.asset_url}")
-        if photo.sci_name:
-            print(f"  {photo.sci_name}")
-        if details.checklist_id:
-            print(f"  Checklist: https://ebird.org/checklist/{details.checklist_id}")
-        if compact_flag:
-            if photo.rating_display:
-                print(f"  Rating: {photo.rating_display}")
-            for label, value, is_camera in select_fields(details, compact_flag):
-                prefix = "[camera] " if is_camera else ""
-                print(f"  {prefix}{label}: {value}")
-            return 0
-        for label, value in photo.metadata_fields(markdown=False):
-            print(f"  {label}: {value}")
-        for label, value in details.exif:
-            print(f"  [camera] {label}: {value}")
-        if not details.exif:
-            print("  [camera] no camera metadata available")
-        return 0
-    sub_id = parse_checklist_id(args[0])
-    photos = await fetch_checklist_photos(sub_id)
-    print(f"{len(photos)} public photo(s) on https://ebird.org/checklist/{sub_id}")
-    for photo in photos:
-        flag = "  [UNCONFIRMED]" if photo.unconfirmed else ""
-        print(f"  ML{photo.asset_id}  {photo.common_name:<30} {photo.asset_url}{flag}")
-        if verbose:
-            for label, value in photo.metadata_fields(markdown=False):
-                print(f"      {label}: {value}")
-    return 0
+    except ChecklistError as error:
+        await delivery.notice(str(error))
+        return
+    learn_names(
+        [(result.display_name, result.user_id)]
+        + [(d.photo.photographer, d.photo.user_id) for d in result.details]
+    )
+    if not result.details:
+        target = f" of {result.species_display}" if result.species_display else ""
+        if result.user_id:
+            await delivery.notice(
+                f"No public media{target} found for `{result.user_id}` — check the ID, "
+                "or pass one of their Macaulay Library asset links."
+            )
+        else:
+            await delivery.notice(f"No public media{target} found.")
+        return
+
+    catalog = f"https://media.ebird.org/catalog?sort={sort}"
+    if result.user_id:
+        catalog += f"&userId={result.user_id}"
+    if media_type:
+        catalog += f"&mediaType={media_type}"
+    if result.species_code:
+        catalog += f"&taxonCode={result.species_code}"
+    if result.region:
+        catalog += f"&regionCode={result.region}"
+    bits = [f"**{header.format(n=len(result.details), sp=result.species_display)}**"]
+    if result.display_name:
+        bits.append(result.display_name)
+    bits.append(f"[full gallery](<{catalog}>)")
+    pages = [build_asset_embed(details, compact_flag) for details in result.details]
+    for number, embed in enumerate(pages, start=1):
+        if len(pages) > 1:
+            footer = embed.footer.text or ""
+            page = f"{number}/{len(pages)}"
+            embed.set_footer(text=f"{footer} · {page}" if footer else page)
+    header_text = " · ".join(bits)
+    # audio/video pages carry the direct file link, which Discord renders
+    # as an inline player under the header
+    contents = [
+        header_text + (f"\n{d.photo.media_url}" if d.photo.media_url else "")
+        for d in result.details
+    ]
+    if len(pages) == 1:
+        await delivery.send(content=contents[0], embed=pages[0])
+        await delivery.finish("Sent 1 item to your DMs.")
+        return
+    pager = EmbedPager(pages, interaction.user.id, contents=contents)
+    pager.message = await delivery.send(
+        content=contents[0], embed=pages[0], view=pager
+    )
+    await delivery.finish(
+        f"Sent {len(pages)} item(s) to your DMs as one paged message."
+    )
+
+
+@bot.tree.command(
+    name="sp",
+    description="Post a user's media of one species (common or scientific name)",
+)
+@app_commands.describe(
+    species="Species — common or scientific name, e.g. 'black oystercatcher'",
+    user="Optional: USER… ID, name, @mention, or their asset link — omit for the global best",
+    count="How many to post (1–50, default 10)",
+    group="Match every species with this in its name (e.g. all puffins; global if no user)",
+    region="Limit species matches and media to a region — code (US-WA) or name (washington)",
+    media="Media type to search (default: all media)",
+    detail=DETAIL_HELP,
+)
+@app_commands.choices(detail=DETAIL_CHOICES, media=MEDIA_CHOICES)
+async def sp_command(
+    interaction: discord.Interaction,
+    species: str,
+    user: str = "",
+    count: app_commands.Range[int, 1, 50] = 10,
+    group: bool = False,
+    region: str = "",
+    media: app_commands.Choice[str] | None = None,
+    detail: app_commands.Choice[str] | None = None,
+) -> None:
+    delivery = await defer_privately(interaction)
+    media_type = media_value(media, "all")
+    await _send_user_photos(
+        interaction, user, count, SORT_BEST,
+        f"Top {{n}} highest rated {MEDIA_WORDS[media_type]} for {{sp}}",
+        species=species, species_group=group, region=region, media_type=media_type,
+        compact_flag=detail_flag(detail), delivery=delivery,
+    )
+
+
+@bot.tree.command(
+    name="top",
+    description="Post an eBird user's highest-rated photos (or audio/video)",
+)
+@app_commands.describe(
+    user="Their USER… ID, name, @mention, or ML asset link; omit for your own (see /iam)",
+    count="How many to post (1–50, default 10)",
+    media="Media type to pull (default: photos)",
+    detail=DETAIL_HELP,
+)
+@app_commands.choices(detail=DETAIL_CHOICES, media=MEDIA_CHOICES)
+async def top_command(
+    interaction: discord.Interaction,
+    user: str = "",
+    count: app_commands.Range[int, 1, 50] = 10,
+    media: app_commands.Choice[str] | None = None,
+    detail: app_commands.Choice[str] | None = None,
+) -> None:
+    delivery = await defer_privately(interaction)
+    whose = user.strip() or linked_user(interaction)
+    if not whose:
+        await delivery.notice(NO_USER_LINKED)
+        return
+    media_type = media_value(media, "photo")
+    await _send_user_photos(
+        interaction, whose, count, SORT_BEST,
+        f"Top {{n}} highest rated {MEDIA_WORDS[media_type]}",
+        media_type=media_type, compact_flag=detail_flag(detail), delivery=delivery,
+    )
+
+
+@bot.tree.command(
+    name="recent",
+    description="Post an eBird user's most recently uploaded photos (or audio/video)",
+)
+@app_commands.describe(
+    user="Their USER… ID, name, @mention, or ML asset link; omit for your own (see /iam)",
+    count="How many to post (1–50, default 10)",
+    obs="Sort by observation date/time instead of upload date",
+    media="Media type to pull (default: photos)",
+    detail=DETAIL_HELP,
+)
+@app_commands.choices(detail=DETAIL_CHOICES, media=MEDIA_CHOICES)
+async def recent_command(
+    interaction: discord.Interaction,
+    user: str = "",
+    count: app_commands.Range[int, 1, 50] = 10,
+    obs: bool = False,
+    media: app_commands.Choice[str] | None = None,
+    detail: app_commands.Choice[str] | None = None,
+) -> None:
+    delivery = await defer_privately(interaction)
+    whose = user.strip() or linked_user(interaction)
+    if not whose:
+        await delivery.notice(NO_USER_LINKED)
+        return
+    flag = detail_flag(detail)
+    media_type = media_value(media, "photo")
+    kind = MEDIA_WORDS[media_type]
+    if obs:
+        await _send_user_photos(
+            interaction, whose, count, SORT_OBS,
+            f"{{n}} most recent {kind} by observation date",
+            media_type=media_type, compact_flag=flag, delivery=delivery,
+        )
+    else:
+        await _send_user_photos(
+            interaction, whose, count, SORT_RECENT,
+            f"{{n}} most recently uploaded {kind}",
+            media_type=media_type, compact_flag=flag, delivery=delivery,
+        )
+
+
+DIGEST_BUDGET = 3900  # leave room under Discord's 4096-char description limit
+MAX_RARE_PHOTO_POSTS = 25  # photo mode is one message per report; digests page instead
+
+
+def place_context(region_code: str, county: str, state: str) -> str:
+    """What locates a report within the queried region: nothing for a county
+    query, the county for a state query, county and state for a country."""
+    depth = region_code.count("-")
+    if depth >= 2:
+        return ""
+    if depth == 1:
+        return county
+    return ", ".join(bit for bit in (county, state) if bit)
+
+
+def build_rare_digest(
+    region_code: str, days: int, reports: list[RareReport], show_rarity: bool = False
+) -> list[discord.Embed]:
+    """The reports condensed into text pages, each within Discord's embed cap."""
+    entries: list[str] = []
+    for report in reports:
+        location = report.location if len(report.location) <= 44 else report.location[:43] + "…"
+        place = place_context(region_code, report.county, report.state)
+        if place:
+            location = f"{location} ({place})" if location else place
+        observer = report.observer if len(report.observer) <= 24 else report.observer[:23] + "…"
+        context = " · ".join(bit for bit in (report.obs_dt, location, observer) if bit)
+        camera = " 📷" if report.details else ""
+        pending = " ⚠️" if report.status == STATUS_PENDING else ""
+        if show_rarity:
+            name = (
+                f"{report.rarity_emoji} **{report.common_name}**{pending}{camera}"
+                f" · {report.rarity_label}"
+            )
+        else:
+            name = f"**{report.common_name}**{pending}{camera}"
+        entries.append(f"{name}\n{context} · [checklist]({report.checklist_url})")
+
+    chunks: list[list[str]] = [[]]
+    used = 0
+    for entry in entries:
+        if chunks[-1] and used + len(entry) + 2 > DIGEST_BUDGET:
+            chunks.append([])
+            used = 0
+        chunks[-1].append(entry)
+        used += len(entry) + 2
+
+    with_photos = sum(1 for report in reports if report.details)
+    unconfirmed = sum(1 for report in reports if report.status == STATUS_PENDING)
+    pages: list[discord.Embed] = []
+    first = 1
+    for number, chunk in enumerate(chunks, start=1):
+        embed = discord.Embed(
+            title=f"Rare birds in {region_code}",
+            description="\n\n".join(chunk),
+            color=EMBED_COLOR,
+        )
+        bits = [
+            f"{len(reports)} report(s)",
+            f"last {days} days",
+            f"📷 = has a photo ({with_photos})",
+        ]
+        if unconfirmed:
+            bits.append(f"⚠️ = unconfirmed ({unconfirmed})")
+        if len(chunks) > 1:
+            bits.insert(0, f"Page {number}/{len(chunks)} · reports {first}–{first + len(chunk) - 1}")
+        embed.set_footer(text=" · ".join(bits))
+        first += len(chunk)
+        pages.append(embed)
+    return pages
+
+
+# Slightly under 15 minutes: an ephemeral digest is edited through the
+# interaction webhook, whose token expires then; quitting first means the
+# timeout edit that disables the buttons still goes through.
+PAGER_TIMEOUT = 840
+
+
+class EmbedPager(discord.ui.View):
+    """Back/Next buttons that page one message through embeds (or embed groups).
+
+    A page is either one embed or a list of embeds shown together, so a
+    /checklist species gallery (several embeds merged into one card) can be
+    a single page.
+    """
+
+    def __init__(
+        self,
+        pages: list[discord.Embed | list[discord.Embed]],
+        owner_id: int,
+        contents: list[str] | None = None,
+    ) -> None:
+        super().__init__(timeout=PAGER_TIMEOUT)
+        self.pages = [
+            [page] if isinstance(page, discord.Embed) else list(page) for page in pages
+        ]
+        # optional per-page message content (e.g. a direct video link Discord
+        # renders as a player); None leaves content untouched on page flips
+        self.contents = contents
+        self.owner_id = owner_id
+        self.index = 0
+        self.message: discord.Message | None = None
+        self._sync()
+
+    def _sync(self) -> None:
+        self.back.disabled = self.index == 0
+        self.forward.disabled = self.index == len(self.pages) - 1
+        self.counter.label = f"{self.index + 1}/{len(self.pages)}"
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.owner_id
+
+    async def _show(self, interaction: discord.Interaction) -> None:
+        self._sync()
+        kwargs: dict = {"embeds": self.pages[self.index], "view": self}
+        if self.contents is not None:
+            kwargs["content"] = self.contents[self.index]
+        await interaction.response.edit_message(**kwargs)
+
+    @discord.ui.button(label="◀ Back", style=discord.ButtonStyle.secondary)
+    async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.index = max(self.index - 1, 0)
+        await self._show(interaction)
+
+    @discord.ui.button(label="1/1", style=discord.ButtonStyle.secondary, disabled=True)
+    async def counter(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        pass  # position indicator only; never enabled
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.primary)
+    async def forward(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        self.index = min(self.index + 1, len(self.pages) - 1)
+        await self._show(interaction)
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass  # the message may be gone; nothing to clean up
+
+
+def build_rare_embed(
+    report: RareReport, compact_flag: str | None, show_rarity: bool = False
+) -> discord.Embed:
+    """One rare-bird report: the photo, who/where/when; rarity tier on request."""
+    embed = build_embed(
+        report.details.photo, checklist_id=report.checklist_id, show_rating=True
+    )
+    if show_rarity:
+        embed.title = f"{report.rarity_emoji} {report.common_name}"
+        embed.add_field(name="Rarity", value=report.rarity_display, inline=False)
+    else:
+        embed.title = report.common_name
+    if compact_flag == COMPACT_FLAG:
+        return embed
+
+    embed.add_field(name="Observed", value=report.obs_dt or "—", inline=True)
+    if report.location:
+        embed.add_field(name="Location", value=report.location[:1024], inline=True)
+    if report.observer:
+        embed.add_field(name="Observer", value=report.observer[:1024], inline=True)
+    embed.add_field(name="Status", value=report.status_display, inline=True)
+    if report.reports_in_window > 1:
+        embed.add_field(
+            name="Other reports", value=f"{report.reports_in_window} in the window", inline=True
+        )
+    if compact_flag:
+        camera = [(label, value) for label, value, is_cam in select_fields(report.details, compact_flag) if is_cam]
+    else:
+        camera = list(report.details.exif)
+    for label, value in camera:
+        if len(embed.fields) >= 25:  # Discord's per-embed field limit
+            break
+        embed.add_field(name=f"📷 {label}", value=value[:1024], inline=True)
+    return embed
+
+
+@bot.tree.command(
+    name="rare",
+    description="Recent rare bird reports for a region, confirmed or not",
+)
+@app_commands.describe(
+    region="eBird region — code (US-WA, US-WA-033) or name (king county wa)",
+    count="How many reports (1–100, default 10; photos:True caps at 25)",
+    days="How many days back to search (1–30, default 14)",
+    repeats="Allow several reports of the same species (default: most recent of each)",
+    confirmed="Only reports eBird reviewers have accepted (default: unconfirmed included)",
+    photos="Only reports with a public photo, posted as photo embeds (default: one text digest)",
+    rarity="Also show an estimated rarity tier per report (default: off, like eBird's alerts)",
+    detail=DETAIL_HELP,
+)
+@app_commands.choices(detail=DETAIL_CHOICES)
+async def rare_command(
+    interaction: discord.Interaction,
+    region: str,
+    count: app_commands.Range[int, 1, 100] = 10,
+    days: app_commands.Range[int, 1, 30] = 14,
+    repeats: bool = False,
+    confirmed: bool = False,
+    photos: bool = False,
+    rarity: bool = False,
+    detail: app_commands.Choice[str] | None = None,
+) -> None:
+    delivery = await defer_privately(interaction)
+    compact_flag = detail_flag(detail)
+    if photos:
+        count = min(count, MAX_RARE_PHOTO_POSTS)  # one message per report in photo mode
+    try:
+        region_code, reports = await fetch_rare_reports(
+            region, count=count, days=days, unique_species=not repeats,
+            require_photo=photos, confirmed_only=confirmed,
+            include_exif=photos and compact_flag != COMPACT_FLAG,
+        )
+    except ChecklistError as error:
+        await delivery.notice(str(error))
+        return
+    if not reports:
+        kind = "eBird-confirmed rarities" if confirmed else "rarities"
+        qualifier = " with public photos" if photos else ""
+        await delivery.notice(
+            f"No {kind}{qualifier} in `{region_code}` over the last {days} days."
+        )
+        return
+
+    if not photos:
+        pages = build_rare_digest(region_code, days, reports, show_rarity=rarity)
+        if len(pages) == 1:
+            await delivery.send(embed=pages[0])
+        else:
+            pager = EmbedPager(pages, interaction.user.id)
+            pager.message = await delivery.send(embed=pages[0], view=pager)
+        await delivery.finish(f"Sent the `{region_code}` rarity digest to your DMs.")
+        return
+
+    learn_names([(r.details.photo.photographer, r.details.photo.user_id) for r in reports if r.details])
+    plural = "ies" if len(reports) != 1 else "y"
+    kind = "confirmed " if confirmed else ""
+    await delivery.send(
+        content=f"**{len(reports)} {kind}rarit{plural} with photos** · `{region_code}` · "
+        f"last {days} days · [region page](<https://ebird.org/region/{region_code}>)"
+    )
+    for report in reports:
+        await delivery.send(embed=build_rare_embed(report, compact_flag, show_rarity=rarity))
+    await delivery.finish(f"Sent {len(reports)} rarity report(s) to your DMs.")
+
+
+@bot.tree.command(
+    name="iam",
+    description="Link your Discord account to your eBird identity for @mention and name lookups",
+)
+@app_commands.describe(user="Your USER… ID or any of your Macaulay Library asset links")
+async def iam_command(interaction: discord.Interaction, user: str) -> None:
+    await interaction.response.defer(ephemeral=True)
+    try:
+        result = await fetch_user_details(user.strip(), count=1, include_exif=False)
+    except ChecklistError as error:
+        await interaction.followup.send(str(error), ephemeral=True)
+        return
+    link_discord(str(interaction.user.id), result.user_id)
+    learn_names([(result.display_name, result.user_id)])
+    await interaction.followup.send(
+        f"Linked! You are **{result.display_name}** (`{result.user_id}`). You can now "
+        "run `/top` and `/recent` without naming a user to get your own photos, and "
+        "your @mention and display name work anywhere a user is asked for.",
+        ephemeral=True,
+    )
+
+
+def build_alert_embed(
+    report: RareReport, subscription: Subscription, kind: str
+) -> discord.Embed:
+    """One rare-bird alert, sized for a DM."""
+    confirming = kind == CONFIRMATION
+    show_rarity = subscription.show_rarity
+    lines = []
+    if report.sci_name:
+        lines.append(f"*{report.sci_name}*")
+    if show_rarity:
+        lines.append(report.rarity_display)
+    if confirming:
+        lines.append("eBird has now reviewed and accepted this record.")
+    if confirming:
+        title = "✅ Confirmed: " + report.common_name
+    elif show_rarity:
+        title = f"{report.rarity_emoji} {report.common_name}"
+    else:
+        title = report.common_name
+    embed = discord.Embed(
+        title=title,
+        url=report.checklist_url,
+        description="\n".join(lines),
+        color=RARITY_COLORS.get(report.rarity_label, EMBED_COLOR) if show_rarity else EMBED_COLOR,
+    )
+    embed.add_field(name="Status", value=report.status_display, inline=True)
+    if report.obs_dt:
+        embed.add_field(name="Observed", value=report.obs_dt, inline=True)
+    if report.how_many:
+        embed.add_field(name="Count", value=str(report.how_many), inline=True)
+    if report.location:
+        place = f"[{report.location}]({report.map_url})" if report.map_url else report.location
+        context = place_context(subscription.region, report.county, report.state)
+        if context:
+            place = f"{place} ({context})"
+        embed.add_field(name="Location", value=place[:1024], inline=False)
+    if report.observer:
+        embed.add_field(name="Observer", value=report.observer[:1024], inline=True)
+    embed.add_field(
+        name="Checklist",
+        value=f"[{report.checklist_id}]({report.checklist_url})",
+        inline=True,
+    )
+    if report.details:
+        photo = report.details.photo
+        embed.set_image(url=photo.image_url(1200))
+        embed.add_field(
+            name="Photo",
+            value=f"[ML{photo.asset_id}]({photo.asset_url}) © {photo.photographer}",
+            inline=False,
+        )
+    embed.set_footer(text=f"{subscription.display_region} · /unalert to stop")
+    return embed
+
+
+async def deliver_alert(subscription: Subscription, embed: discord.Embed) -> bool:
+    """DM one alert; False when Discord wouldn't take it."""
+    try:
+        user = bot.get_user(int(subscription.user_id))
+        if user is None:
+            user = await bot.fetch_user(int(subscription.user_id))
+        await user.send(embed=embed)
+        return True
+    except (discord.Forbidden, discord.NotFound):
+        return False  # DMs closed, or the account is gone
+    except (discord.HTTPException, ValueError, AttributeError) as error:
+        print(f"Alert DM to {subscription.user_id} failed: {error!r}")
+        return False
+
+
+async def poll_region(
+    region: str, subscriptions: list[Subscription], session: aiohttp.ClientSession
+) -> bool:
+    """Alert every subscriber of this region about what they haven't seen. True if state changed."""
+    # max_age=0: alerts must never run on a cached feed, or a poll could miss
+    # reports that landed since the last fetch
+    observations = await fetch_notable(
+        region, days=ALERT_WINDOW_DAYS, session=session, max_age=0
+    )
+    per_species = Counter(obs.get("speciesCode") for obs in observations)
+
+    # one entry per (checklist, species), keeping the latest review state
+    latest: dict[str, dict] = {}
+    for obs in observations:
+        if notable_status(obs) == STATUS_REJECTED:
+            continue  # a record reviewers threw out is not an alert
+        key = notable_key(obs)
+        prior = latest.get(key)
+        if prior is None or (obs.get("obsDt") or "") > (prior.get("obsDt") or ""):
+            latest[key] = obs
+
+    # only build reports somebody is actually owed: rarity and photo lookups cost requests
+    owed = [
+        obs for key, obs in latest.items()
+        if any(sub.pending_kind(key, notable_status(obs)) for sub in subscriptions)
+    ]
+    if not owed:
+        return False
+    owed.sort(key=lambda obs: obs.get("obsDt") or "", reverse=True)
+    pairs = await attach_photos(owed[:ALERT_BUILD_MAX], session=session)
+    reports = await build_rare_reports(
+        region, pairs, session=session, per_species=per_species
+    )
+    reports.sort(key=lambda report: report.obs_dt)  # DM oldest first, so DMs read in order
+
+    changed = False
+    for subscription in subscriptions:
+        sent = 0
+        for report in reports:
+            key = f"{report.checklist_id}:{report.species_code}"
+            rarity = f"{report.rarity_emoji} {report.rarity_label}".strip()
+            kind = subscription.pending_kind(key, report.status)
+            if kind is None:
+                continue
+            if not subscription.wants_rarity(report.rarity_label):
+                # record it anyway, or every poll would rebuild the same report
+                subscription.mark_seen(
+                    key, report.obs_dt, report.status, report.common_name, rarity,
+                    place_context(subscription.region, report.county, report.state),
+                )
+                changed = True
+                continue
+            if sent >= ALERT_DM_MAX:
+                break
+            if await deliver_alert(subscription, build_alert_embed(report, subscription, kind)):
+                subscription.mark_seen(
+                    key, report.obs_dt, report.status, report.common_name, rarity,
+                    place_context(subscription.region, report.county, report.state),
+                )
+                subscription.alerts_sent += 1
+                subscription.last_alert = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                subscription.failures = 0
+                sent += 1
+            else:
+                subscription.failures += 1
+                if subscription.failures >= ALERT_FAILURE_LIMIT:
+                    subscription.paused = True
+                    print(
+                        f"Pausing alerts for {subscription.user_id} in {subscription.region}: "
+                        f"{subscription.failures} DM failures in a row."
+                    )
+                changed = True
+                break  # stop hammering a mailbox that is not accepting DMs
+            changed = True
+    return changed
+
+
+async def run_alert_poll() -> None:
+    """One sweep over every watched region."""
+    regions = store.regions()
+    if not regions:
+        return
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=ALERT_WINDOW_DAYS + 1)
+    ).strftime("%Y-%m-%d %H:%M")
+    changed = False
+    async with aiohttp.ClientSession() as session:
+        for region in regions:
+            watchers = [sub for sub in store.active() if sub.region == region]
+            if not watchers:
+                continue
+            try:
+                changed |= await poll_region(region, watchers, session)
+            except ChecklistError as error:
+                print(f"Alert poll for {region} failed: {error}")
+            except (aiohttp.ClientError, asyncio.TimeoutError) as error:
+                print(f"Alert poll for {region} failed: {error!r}")
+    for subscription in store.subscriptions:
+        changed |= subscription.prune(cutoff)
+    if changed:
+        store.save()
+
+
+async def alert_loop() -> None:
+    """Poll for new rarities forever; one bad sweep must never kill the loop."""
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            await run_alert_poll()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - the loop outranks any single failure
+            print(f"Alert poll crashed: {error!r}")
+        await asyncio.sleep(ALERT_INTERVAL_SECONDS)
+
+
+@bot.tree.command(
+    name="alert",
+    description="DM me whenever a rare bird is reported in a region",
+)
+@app_commands.describe(
+    region="eBird region: a code (US-WA, US-WA-033) or a name (king county wa)",
+    rarity="Only alert at this tier or rarer (default: anything eBird flags)",
+    confirmations="Also DM when a report you were alerted to is later accepted by eBird",
+    show_rarity="Show an estimated rarity tier in each alert (default: off, like eBird's alerts)",
+)
+@app_commands.choices(
+    rarity=[app_commands.Choice(name=label, value=level) for level, label in RARITY_LEVELS]
+)
+async def alert_command(
+    interaction: discord.Interaction,
+    region: str,
+    rarity: app_commands.Choice[int] | None = None,
+    confirmations: bool = False,
+    show_rarity: bool = False,
+) -> None:
+    await interaction.response.defer(ephemeral=True)
+    try:
+        async with aiohttp.ClientSession() as session:
+            code = await resolve_region_code(region, session=session)
+            label = await region_name(code, session=session)
+            # seed with everything already in the window, so subscribing doesn't
+            # dump days of backlog into the user's DMs
+            backlog = await fetch_notable(code, days=ALERT_WINDOW_DAYS, session=session)
+            # tier each seeded species now so /alerts can show it later; one
+            # cached baseline fetch, then the per-species lookups are free
+            tiers: dict[str, str] = {}
+            for species_code in {o.get("speciesCode") for o in backlog}:
+                if not species_code:
+                    continue
+                tier, emoji, share, _ = await species_rarity(code, species_code, session)
+                tiers[species_code] = f"{emoji} {tier}".strip() if share is not None else ""
+    except ChecklistError as error:
+        await interaction.followup.send(str(error), ephemeral=True)
+        return
+
+    subscription = Subscription(
+        user_id=str(interaction.user.id),
+        region=code,
+        region_label=label,
+        min_rarity=rarity.value if rarity else 0,
+        confirmations=confirmations,
+        show_rarity=show_rarity,
+        created=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    )
+    for obs in backlog:
+        subscription.mark_seen(
+            notable_key(obs),
+            obs.get("obsDt") or "",
+            notable_status(obs),
+            species=obs.get("comName") or "",
+            rarity=tiers.get(obs.get("speciesCode") or "", ""),
+            place=place_context(
+                code, obs.get("subnational2Name") or "", obs.get("subnational1Name") or ""
+            ),
+        )
+    store.add(subscription)
+    store.save()
+
+    minutes = ALERT_INTERVAL_SECONDS // 60
+    summary = (
+        f"Watching **{label}** (`{code}`) for you.\n"
+        f"Tier: {subscription.rarity_label} · checked every {minutes} min · "
+        f"confirmations: {'on' if confirmations else 'off'}\n"
+        f"{len(backlog)} report(s) already in the window were marked as seen, so you'll "
+        "only hear about new ones. Use `/alerts` to review or `/unalert` to stop."
+    )
+    greeting = discord.Embed(
+        title=f"🔔 Rare bird alerts on for {label}",
+        description=(
+            f"You'll get a DM like this when a new rarity is reported.\n"
+            f"Tier: {subscription.rarity_label}"
+        ),
+        color=EMBED_COLOR,
+    )
+    if not await deliver_alert(subscription, greeting):
+        summary += (
+            "\n\n⚠️ I couldn't DM you. Enable **Settings → Privacy & Safety → "
+            "Direct Messages** for this server, or alerts will pause after "
+            f"{ALERT_FAILURE_LIMIT} failures."
+        )
+    await interaction.followup.send(summary, ephemeral=True)
+
+
+def seen_line(key: str, value: list[str]) -> str:
+    """One remembered report as a digest line for /alerts."""
+    obs_dt, status, species, rarity, place = value
+    checklist_id, _, species_code = key.partition(":")
+    name = species or species_code or checklist_id
+    bits = [
+        rarity,
+        f"**{name}** {STATUS_MARKS.get(status, '')}".strip(),
+        place,
+        obs_dt,
+        f"[{checklist_id}](https://ebird.org/checklist/{checklist_id})",
+    ]
+    return "> " + " · ".join(bit for bit in bits if bit)
+
+
+ALERTS_LIST_BUDGET = 4000  # embed descriptions cap at 4096
+
+
+@bot.tree.command(name="alerts", description="Show your rare bird alert subscriptions")
+async def alerts_command(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True)
+    mine = store.for_user(str(interaction.user.id))
+    if not mine:
+        await interaction.followup.send(
+            "No alert subscriptions yet. Start one with `/alert region:king county wa`.",
+            ephemeral=True,
+        )
+        return
+
+    # rows recorded before tiers/places were stored have blanks; fill them in
+    # (tiers from the cached season baselines, places from the notable feed,
+    # which still covers every row because seen rows prune at the window edge)
+    filled = False
+    async with aiohttp.ClientSession() as session:
+        for subscription in mine:
+            feed: dict[str, dict] | None = None
+            for key, value in subscription.recent_seen(3):
+                species_code = key.partition(":")[2]
+                if not value[3] and species_code:
+                    tier, emoji, share, _ = await species_rarity(
+                        subscription.region, species_code, session
+                    )
+                    if share is not None:
+                        value[3] = f"{emoji} {tier}".strip()
+                        filled = True
+                if not value[4] and subscription.region.count("-") < 2:
+                    if feed is None:
+                        try:
+                            feed = {
+                                notable_key(obs): obs for obs in await fetch_notable(
+                                    subscription.region, days=ALERT_WINDOW_DAYS,
+                                    session=session,
+                                )
+                            }
+                        except (ChecklistError, aiohttp.ClientError, asyncio.TimeoutError):
+                            feed = {}
+                    obs = feed.get(key)
+                    if obs is not None:
+                        value[4] = place_context(
+                            subscription.region,
+                            obs.get("subnational2Name") or "",
+                            obs.get("subnational1Name") or "",
+                        )
+                        filled = filled or bool(value[4])
+    if filled:
+        store.save()
+
+    blocks = []
+    for subscription in sorted(mine, key=lambda s: s.region):
+        bits = [subscription.rarity_label, f"{subscription.alerts_sent} sent"]
+        if subscription.confirmations:
+            bits.append("confirmations on")
+        if subscription.show_rarity:
+            bits.append("rarity labels on")
+        if subscription.paused:
+            bits.append("⚠️ paused (DMs failed; re-run `/alert` to resume)")
+        if subscription.last_alert:
+            bits.append(f"last {subscription.last_alert[:16].replace('T', ' ')}")
+        lines = [
+            f"**{subscription.display_region}** (`{subscription.region}`)",
+            " · ".join(bits),
+        ]
+        lines += [seen_line(key, value) for key, value in subscription.recent_seen(3)]
+        blocks.append("\n".join(lines))
+    kept: list[str] = []
+    used = 0
+    for block in blocks:
+        if used + len(block) + 2 > ALERTS_LIST_BUDGET:
+            kept.append(f"…and {len(blocks) - len(kept)} more region(s)")
+            break
+        kept.append(block)
+        used += len(block) + 2
+    embed = discord.Embed(
+        title="🔔 Your rare bird alerts",
+        description="\n\n".join(kept),
+        color=EMBED_COLOR,
+    )
+    embed.set_footer(text=f"Checked every {ALERT_INTERVAL_SECONDS // 60} min · /unalert to stop one")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="unalert", description="Stop rare bird alerts for a region")
+@app_commands.describe(region="Region to stop watching; leave empty to cancel all of them")
+async def unalert_command(interaction: discord.Interaction, region: str = "") -> None:
+    await interaction.response.defer(ephemeral=True)
+    user_id = str(interaction.user.id)
+    if not region.strip():
+        removed = store.remove_all(user_id)
+        store.save()
+        await interaction.followup.send(
+            f"Cancelled {removed} alert subscription(s)." if removed
+            else "You had no alert subscriptions.",
+            ephemeral=True,
+        )
+        return
+    try:
+        code = await resolve_region_code(region)
+    except ChecklistError as error:
+        await interaction.followup.send(str(error), ephemeral=True)
+        return
+    dropped = store.remove(user_id, code)
+    store.save()
+    if dropped is None:
+        await interaction.followup.send(
+            f"You weren't watching `{code}`. Use `/alerts` to see your subscriptions.",
+            ephemeral=True,
+        )
+        return
+    await interaction.followup.send(
+        f"Stopped alerts for **{dropped.display_region}** (`{code}`).", ephemeral=True
+    )
+
+
+def main() -> None:
+    token = os.getenv("DISCORD_TOKEN")
+    if not token:
+        raise SystemExit(
+            "DISCORD_TOKEN is not set — copy .env.example to .env and add your bot token."
+        )
+    bot.run(token)
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(asyncio.run(_main(sys.argv[1:])))
-    except ChecklistError as error:
-        print(error, file=sys.stderr)
-        raise SystemExit(1)
+    main()
