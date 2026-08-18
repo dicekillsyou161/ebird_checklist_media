@@ -219,7 +219,7 @@ class RareReport:
     rarity_label: str
     rarity_emoji: str
     rarity_share: float | None  # % of sampled season-days with a report, None if unknown
-    rarity_note: str            # e.g. "reported 2 of 30 season-days since 2020 in US-WA-033"
+    rarity_note: str            # e.g. "2+ confirmed reports in season since 2020 in US-WA-033"
     details: AssetDetails | None   # None in text mode, where photos aren't fetched
     status: str = STATUS_CONFIRMED
     latitude: float | None = None
@@ -1162,10 +1162,10 @@ async def _rarity(
         return "Notable sighting", "⚪", None, ""
     mine = baseline["days"].get(species_code, 0)
     share = 100 * mine / sampled
-    note = (
-        f"reported {mine} of {sampled} season-days since {baseline['since']}"
-        f" in {baseline['scope']}"
-    )
+    # each sampled day the species appeared carries at least one accepted
+    # record, so the day count is a floor on confirmed reports; "+" says so
+    count = f"{mine}+ confirmed reports" if mine else "no confirmed reports"
+    note = f"{count} in season since {baseline['since']} in {baseline['scope']}"
     for threshold, label, emoji in RARITY_TIERS:
         if share < threshold:
             return label, emoji, share, note
