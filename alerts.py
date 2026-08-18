@@ -40,10 +40,12 @@ CONFIRMATION = "confirmed"  # already alerted while pending, now reviewed & acce
 
 STATUS_MARKS = {STATUS_CONFIRMED: "✅", STATUS_PENDING: "⏳", STATUS_REJECTED: "❌"}
 
-# One remembered report is [obs_dt, status, species, rarity]. The last two are
-# display-only, so /alerts can list recent reports without re-fetching anything;
-# they stay empty on rows written before they existed (or seeded pre-rating).
-_SEEN_WIDTH = 4
+# One remembered report is [obs_dt, status, species, rarity, place]. Everything
+# after status is display-only, so /alerts can list recent reports without
+# re-fetching anything; fields stay empty on rows written before they existed.
+# `place` is county ("King") for a state region, "King, Washington" for a
+# country, and empty for a county region, where it would just repeat.
+_SEEN_WIDTH = 5
 
 _SUB_COLUMNS = (
     "user_id, region, region_label, min_rarity, confirmations, "
@@ -130,13 +132,15 @@ class Subscription:
         return RARITY_RANK.get(label, 0) >= self.min_rarity
 
     def mark_seen(
-        self, key: str, obs_dt: str, status: str, species: str = "", rarity: str = ""
+        self, key: str, obs_dt: str, status: str,
+        species: str = "", rarity: str = "", place: str = "",
     ) -> None:
         prior = self.seen.get(key)
         if prior is not None:  # a status update mustn't blank what's already known
             species = species or prior[2]
             rarity = rarity or prior[3]
-        self.seen[key] = [obs_dt or "", status, species, rarity]
+            place = place or prior[4]
+        self.seen[key] = [obs_dt or "", status, species, rarity, place]
 
     def recent_seen(self, limit: int = 3) -> list[tuple[str, list[str]]]:
         """The newest remembered reports, for showing back in /alerts."""
@@ -198,8 +202,8 @@ class AlertStore:
                     imported += 1
                     self.conn.executemany(
                         "INSERT OR IGNORE INTO seen"
-                        " (user_id, region, key, obs_dt, status, species, rarity)"
-                        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        " (user_id, region, key, obs_dt, status, species, rarity, place)"
+                        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                         [
                             (sub.user_id, sub.region, key, *value)
                             for key, value in sub.seen.items()
@@ -219,12 +223,13 @@ class AlertStore:
             subscriptions.append(sub)
             by_key[(sub.user_id, sub.region)] = sub
         for row in self.conn.execute(
-            "SELECT user_id, region, key, obs_dt, status, species, rarity FROM seen"
+            "SELECT user_id, region, key, obs_dt, status, species, rarity, place FROM seen"
         ):
             sub = by_key.get((row["user_id"], row["region"]))
             if sub is not None:
                 sub.seen[row["key"]] = [
-                    row["obs_dt"], row["status"], row["species"], row["rarity"]
+                    row["obs_dt"], row["status"], row["species"], row["rarity"],
+                    row["place"],
                 ]
         self.subscriptions = subscriptions
 
@@ -240,8 +245,8 @@ class AlertStore:
                 )
                 self.conn.executemany(
                     "INSERT INTO seen"
-                    " (user_id, region, key, obs_dt, status, species, rarity)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    " (user_id, region, key, obs_dt, status, species, rarity, place)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     [
                         (sub.user_id, sub.region, key, *value)
                         for key, value in sub.seen.items()
