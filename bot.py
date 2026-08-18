@@ -54,8 +54,15 @@ from ebird_media import (
 load_dotenv()
 
 MAX_PHOTOS_POSTED = 50  # keep one command from flooding a channel
+EMBEDS_PER_MESSAGE = 10  # Discord's per-message embed limit
 FIELD_VALUE_MAX = 300            # display cap for one metadata value (Discord allows 1024)
 EMBED_COLOR = discord.Color.from_str("#4a7628")  # eBird green
+RARITY_COLORS = {  # only used when a subscriber opts into rarity labels
+    "Mega rarity": discord.Color.from_str("#c62828"),
+    "Very rare": discord.Color.from_str("#ef6c00"),
+    "Rare": discord.Color.from_str("#f9a825"),
+    "Scarce": discord.Color.from_str("#2e7d32"),
+}
 
 # One `detail` option on every command, in place of the old -c/-cc/-ccc/-vvv
 # text flags. Values are the internal compact-flag constants; "full" means none.
@@ -144,14 +151,6 @@ HERE = Path(__file__).resolve().parent
 DB = db.connect(HERE / "bot.db")
 
 store = AlertStore(DB, legacy_json=HERE / "subscriptions.json")
-
-RARITY_COLORS = {  # match the tier emoji so an alert reads at a glance
-    "Mega rarity": discord.Color.from_str("#c62828"),
-    "Very rare": discord.Color.from_str("#ef6c00"),
-    "Rare": discord.Color.from_str("#f9a825"),
-    "Scarce": discord.Color.from_str("#2e7d32"),
-}
-
 
 # Learned identities: Discord links (via /iam) and display names seen in any
 # command's results, so "@mention" and "Mark Zorthesosen" work as user refs.
@@ -557,27 +556,39 @@ async def checklist_command(
     first = photos[0]
     detail_bits = [bit for bit in (first.photographer, first.obs_date, first.location) if bit]
     plural = "s" if len(photos) != 1 else ""
-    await delivery.send(
-        content=f"**{len(photos)} public photo{plural}** · "
+    header = (
+        f"**{len(photos)} public photo{plural}** · "
         f"{species_count} species · {' · '.join(detail_bits)}\n<{checklist_url}>"
     )
+    if len(photos) > MAX_PHOTOS_POSTED:
+        header += f"\n…showing the first {MAX_PHOTOS_POSTED} photos; the rest are at the link"
 
-    # one message per species: its photos ride along as a gallery on a single card
+    # one page per species: its photos ride along as gallery cards on that page
+    pages: list[list[discord.Embed]] = []
     posted = 0
     for group in group_by_species(photos):
         if posted >= MAX_PHOTOS_POSTED:
             break
         allowed = group[:MAX_PHOTOS_POSTED - posted]
+        page: list[discord.Embed] = []
         for embeds in build_species_messages(allowed, detail=flag):
-            await delivery.send(embeds=embeds)
+            if page and len(page) + len(embeds) > EMBEDS_PER_MESSAGE:
+                pages.append(page)  # a species with very many photos spills over
+                page = []
+            page.extend(embeds)
+        if page:
+            pages.append(page)
         posted += len(allowed)
 
-    if len(photos) > MAX_PHOTOS_POSTED:
-        await delivery.send(
-            content=f"…showing the first {MAX_PHOTOS_POSTED} of {len(photos)} photos — "
-            f"see the rest at <{checklist_url}>"
-        )
-    await delivery.finish(f"Sent {posted} photo(s) from `{sub_id}` to your DMs.")
+    if len(pages) == 1:
+        await delivery.send(content=header, embeds=pages[0])
+    else:
+        pager = EmbedPager(pages, interaction.user.id)
+        pager.message = await delivery.send(content=header, embeds=pages[0], view=pager)
+    await delivery.finish(
+        f"Sent {posted} photo(s) from `{sub_id}` to your DMs"
+        + (" as one paged message." if len(pages) > 1 else ".")
+    )
 
 
 @bot.tree.command(
@@ -812,7 +823,7 @@ MAX_RARE_PHOTO_POSTS = 25  # photo mode is one message per report; digests page 
 
 
 def build_rare_digest(
-    region_code: str, days: int, reports: list[RareReport]
+    region_code: str, days: int, reports: list[RareReport], show_rarity: bool = False
 ) -> list[discord.Embed]:
     """The reports condensed into text pages, each within Discord's embed cap."""
     county_region = region_code.count("-") >= 2  # every line would repeat it
@@ -825,11 +836,14 @@ def build_rare_digest(
         context = " · ".join(bit for bit in (report.obs_dt, location, observer) if bit)
         camera = " 📷" if report.details else ""
         pending = " ⚠️" if report.status == STATUS_PENDING else ""
-        entries.append(
-            f"{report.rarity_emoji} **{report.common_name}**{pending}{camera}"
-            f" · {report.rarity_label}\n"
-            f"{context} · [checklist]({report.checklist_url})"
-        )
+        if show_rarity:
+            name = (
+                f"{report.rarity_emoji} **{report.common_name}**{pending}{camera}"
+                f" · {report.rarity_label}"
+            )
+        else:
+            name = f"**{report.common_name}**{pending}{camera}"
+        entries.append(f"{name}\n{context} · [checklist]({report.checklist_url})")
 
     chunks: list[list[str]] = [[]]
     used = 0
@@ -872,11 +886,20 @@ PAGER_TIMEOUT = 840
 
 
 class EmbedPager(discord.ui.View):
-    """Back/Next buttons that page one message through a list of embeds."""
+    """Back/Next buttons that page one message through embeds (or embed groups).
 
-    def __init__(self, pages: list[discord.Embed], owner_id: int) -> None:
+    A page is either one embed or a list of embeds shown together, so a
+    /checklist species gallery (several embeds merged into one card) can be
+    a single page.
+    """
+
+    def __init__(
+        self, pages: list[discord.Embed | list[discord.Embed]], owner_id: int
+    ) -> None:
         super().__init__(timeout=PAGER_TIMEOUT)
-        self.pages = pages
+        self.pages = [
+            [page] if isinstance(page, discord.Embed) else list(page) for page in pages
+        ]
         self.owner_id = owner_id
         self.index = 0
         self.message: discord.Message | None = None
@@ -885,18 +908,23 @@ class EmbedPager(discord.ui.View):
     def _sync(self) -> None:
         self.back.disabled = self.index == 0
         self.forward.disabled = self.index == len(self.pages) - 1
+        self.counter.label = f"{self.index + 1}/{len(self.pages)}"
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == self.owner_id
 
     async def _show(self, interaction: discord.Interaction) -> None:
         self._sync()
-        await interaction.response.edit_message(embed=self.pages[self.index], view=self)
+        await interaction.response.edit_message(embeds=self.pages[self.index], view=self)
 
     @discord.ui.button(label="◀ Back", style=discord.ButtonStyle.secondary)
     async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         self.index = max(self.index - 1, 0)
         await self._show(interaction)
+
+    @discord.ui.button(label="1/1", style=discord.ButtonStyle.secondary, disabled=True)
+    async def counter(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        pass  # position indicator only; never enabled
 
     @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.primary)
     async def forward(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -913,13 +941,18 @@ class EmbedPager(discord.ui.View):
                 pass  # the message may be gone; nothing to clean up
 
 
-def build_rare_embed(report: RareReport, compact_flag: str | None) -> discord.Embed:
-    """A rare-bird alert: the photo, who/where/when, and how rare it is."""
+def build_rare_embed(
+    report: RareReport, compact_flag: str | None, show_rarity: bool = False
+) -> discord.Embed:
+    """One rare-bird report: the photo, who/where/when; rarity tier on request."""
     embed = build_embed(
         report.details.photo, checklist_id=report.checklist_id, show_rating=True
     )
-    embed.title = f"{report.rarity_emoji} {report.common_name}"
-    embed.add_field(name="Rarity", value=report.rarity_display, inline=False)
+    if show_rarity:
+        embed.title = f"{report.rarity_emoji} {report.common_name}"
+        embed.add_field(name="Rarity", value=report.rarity_display, inline=False)
+    else:
+        embed.title = report.common_name
     if compact_flag == COMPACT_FLAG:
         return embed
 
@@ -955,6 +988,7 @@ def build_rare_embed(report: RareReport, compact_flag: str | None) -> discord.Em
     repeats="Allow several reports of the same species (default: most recent of each)",
     confirmed="Only reports eBird reviewers have accepted (default: unconfirmed included)",
     photos="Only reports with a public photo, posted as photo embeds (default: one text digest)",
+    rarity="Also show an estimated rarity tier per report (default: off, like eBird's alerts)",
     detail=DETAIL_HELP,
 )
 @app_commands.choices(detail=DETAIL_CHOICES)
@@ -966,6 +1000,7 @@ async def rare_command(
     repeats: bool = False,
     confirmed: bool = False,
     photos: bool = False,
+    rarity: bool = False,
     detail: app_commands.Choice[str] | None = None,
 ) -> None:
     delivery = await defer_privately(interaction)
@@ -990,7 +1025,7 @@ async def rare_command(
         return
 
     if not photos:
-        pages = build_rare_digest(region_code, days, reports)
+        pages = build_rare_digest(region_code, days, reports, show_rarity=rarity)
         if len(pages) == 1:
             await delivery.send(embed=pages[0])
         else:
@@ -1007,7 +1042,7 @@ async def rare_command(
         f"last {days} days · [region page](<https://ebird.org/region/{region_code}>)"
     )
     for report in reports:
-        await delivery.send(embed=build_rare_embed(report, compact_flag))
+        await delivery.send(embed=build_rare_embed(report, compact_flag, show_rarity=rarity))
     await delivery.finish(f"Sent {len(reports)} rarity report(s) to your DMs.")
 
 
@@ -1038,17 +1073,25 @@ def build_alert_embed(
 ) -> discord.Embed:
     """One rare-bird alert, sized for a DM."""
     confirming = kind == CONFIRMATION
+    show_rarity = subscription.show_rarity
     lines = []
     if report.sci_name:
         lines.append(f"*{report.sci_name}*")
-    lines.append(report.rarity_display)
+    if show_rarity:
+        lines.append(report.rarity_display)
     if confirming:
         lines.append("eBird has now reviewed and accepted this record.")
+    if confirming:
+        title = "✅ Confirmed: " + report.common_name
+    elif show_rarity:
+        title = f"{report.rarity_emoji} {report.common_name}"
+    else:
+        title = report.common_name
     embed = discord.Embed(
-        title=("✅ Confirmed: " if confirming else f"{report.rarity_emoji} ") + report.common_name,
+        title=title,
         url=report.checklist_url,
         description="\n".join(lines),
-        color=RARITY_COLORS.get(report.rarity_label, EMBED_COLOR),
+        color=RARITY_COLORS.get(report.rarity_label, EMBED_COLOR) if show_rarity else EMBED_COLOR,
     )
     embed.add_field(name="Status", value=report.status_display, inline=True)
     if report.obs_dt:
@@ -1073,9 +1116,7 @@ def build_alert_embed(
             value=f"[ML{photo.asset_id}]({photo.asset_url}) © {photo.photographer}",
             inline=False,
         )
-    embed.set_footer(
-        text=f"{subscription.display_region} · {subscription.rarity_label} · /unalert to stop"
-    )
+    embed.set_footer(text=f"{subscription.display_region} · /unalert to stop")
     return embed
 
 
@@ -1216,6 +1257,7 @@ async def alert_loop() -> None:
     region="eBird region: a code (US-WA, US-WA-033) or a name (king county wa)",
     rarity="Only alert at this tier or rarer (default: anything eBird flags)",
     confirmations="Also DM when a report you were alerted to is later accepted by eBird",
+    show_rarity="Show an estimated rarity tier in each alert (default: off, like eBird's alerts)",
 )
 @app_commands.choices(
     rarity=[app_commands.Choice(name=label, value=level) for level, label in RARITY_LEVELS]
@@ -1225,6 +1267,7 @@ async def alert_command(
     region: str,
     rarity: app_commands.Choice[int] | None = None,
     confirmations: bool = False,
+    show_rarity: bool = False,
 ) -> None:
     await interaction.response.defer(ephemeral=True)
     try:
@@ -1244,6 +1287,7 @@ async def alert_command(
         region_label=label,
         min_rarity=rarity.value if rarity else 0,
         confirmations=confirmations,
+        show_rarity=show_rarity,
         created=datetime.now(timezone.utc).isoformat(timespec="seconds"),
     )
     for obs in backlog:
@@ -1313,6 +1357,8 @@ async def alerts_command(interaction: discord.Interaction) -> None:
         bits = [subscription.rarity_label, f"{subscription.alerts_sent} sent"]
         if subscription.confirmations:
             bits.append("confirmations on")
+        if subscription.show_rarity:
+            bits.append("rarity labels on")
         if subscription.paused:
             bits.append("⚠️ paused (DMs failed; re-run `/alert` to resume)")
         if subscription.last_alert:
