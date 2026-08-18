@@ -156,10 +156,24 @@ class Photo:
     notes: str = ""
     tags: str = ""
     user_id: str = ""  # eBird USER… ID of the photographer
+    media_type: str = "photo"  # photo | audio | video
 
     @property
     def asset_url(self) -> str:
         return f"https://macaulaylibrary.org/asset/{self.asset_id}"
+
+    @property
+    def has_image(self) -> bool:
+        """Whether the CDN serves a still for this asset (video posters count)."""
+        return self.media_type in ("photo", "video")
+
+    @property
+    def type_label(self) -> str:
+        if self.media_type == "audio":
+            return "🎧 Audio recording"
+        if self.media_type == "video":
+            return "🎥 Video"
+        return ""
 
     def image_url(self, size: int = 1200) -> str:
         return f"https://cdn.download.ams.birds.cornell.edu/api/v2/asset/{self.asset_id}/{size}"
@@ -741,16 +755,18 @@ async def resolve_species(
 
 
 async def _paged_user_search(
-    session: aiohttp.ClientSession, user_id: str, *, sort: str, all_media: bool,
+    session: aiohttp.ClientSession, user_id: str, *, sort: str, media_type: str = "photo",
     region_code: str = "",
 ) -> list[dict]:
-    """Page through a user's media in server sort order, up to MAX_PHOTOS items."""
+    """Page through a user's media in server sort order, up to MAX_PHOTOS items.
+
+    `media_type` is photo/audio/video, or empty for every kind."""
     items: list[dict] = []
     cursor: str | None = None
     while len(items) < MAX_PHOTOS:
         params: dict = {"userId": user_id, "sort": sort, "count": PAGE_SIZE, "unconfirmed": "incl"}
-        if not all_media:
-            params["mediaType"] = "photo"
+        if media_type:
+            params["mediaType"] = media_type
         if region_code:
             params["regionCode"] = region_code
         if cursor:
@@ -773,16 +789,17 @@ async def fetch_user_details(
     sort: str = SORT_BEST,
     species_query: str | None = None,
     species_group: bool = False,
-    all_media: bool = False,
+    media_type: str = "photo",
     region: str = "",
     session: aiohttp.ClientSession | None = None,
 ) -> UserMedia:
     """A user's public media, ranked by `sort`, optionally one species only.
 
-    Photos only unless `all_media`. With `species_group`, `species_query` is
-    a name substring matched against every species in the user's library
-    (their most recent/best MAX_PHOTOS items) instead of one resolved taxon.
-    EXIF fetches are skipped when the caller won't show camera fields.
+    `media_type` is photo/audio/video, or empty for every kind. With
+    `species_group`, `species_query` is a name substring matched against every
+    species in the user's library (their most recent/best MAX_PHOTOS items)
+    instead of one resolved taxon. EXIF fetches are skipped when the caller
+    won't show camera fields.
     """
     owns_session = session is None
     if owns_session:
@@ -803,7 +820,7 @@ async def fetch_user_details(
             needle = species_query.strip().lower()
             species_display = f"“{species_query.strip()}”"
             everything = await _paged_user_search(
-                session, user_id, sort=sort, all_media=all_media, region_code=region_code
+                session, user_id, sort=sort, media_type=media_type, region_code=region_code
             )
             # prefer common-name matches so "puffin" doesn't drag in Puffinus shearwaters
             by_common = [
@@ -849,8 +866,8 @@ async def fetch_user_details(
             async def one_taxon(code: str) -> list[dict]:
                 async with semaphore:
                     params: dict = {"sort": sort, "count": count, "unconfirmed": "incl", "taxonCode": code}
-                    if not all_media:
-                        params["mediaType"] = "photo"
+                    if media_type:
+                        params["mediaType"] = media_type
                     if region_code:
                         params["regionCode"] = region_code
                     return await _search(session, **params)
@@ -867,8 +884,8 @@ async def fetch_user_details(
             params: dict = {"sort": sort, "count": count, "unconfirmed": "incl"}
             if user_id:
                 params["userId"] = user_id
-            if not all_media:
-                params["mediaType"] = "photo"
+            if media_type:
+                params["mediaType"] = media_type
             if species_code:
                 params["taxonCode"] = species_code
             if region_code:
@@ -985,6 +1002,7 @@ def _to_photo(item: dict) -> Photo:
         height=item.get("height"),
         latitude=location.get("latitude"),
         longitude=location.get("longitude"),
+        media_type=item.get("mediaType") or "photo",
         obs_time=_format_obs_time(item.get("obsTime")),
         age_sex=_summarize_age_sex(item.get("ageSex") or {}),
         notes="; ".join(bit for bit in (item.get("caption"), item.get("mediaNotes")) if bit),
@@ -1004,7 +1022,8 @@ def _group_by_species(photos: list[Photo]) -> list[Photo]:
 async def fetch_checklist_photos(
     sub_id: str, *, session: aiohttp.ClientSession | None = None
 ) -> list[Photo]:
-    """Return every public photo on the checklist, grouped by species."""
+    """Return every public media item on the checklist (photos, audio, video),
+    grouped by species."""
     owns_session = session is None
     if owns_session:
         session = aiohttp.ClientSession()
@@ -1016,7 +1035,6 @@ async def fetch_checklist_photos(
             # which the search index otherwise omits
             params = {
                 "subId": sub_id,
-                "mediaType": "photo",
                 "count": str(PAGE_SIZE),
                 "unconfirmed": "incl",
             }
@@ -1548,7 +1566,7 @@ async def _main(argv: list[str]) -> int:
             args[0], count=count, sort=sort, include_exif=False,
             species_query=" ".join(species_words) or None,
             species_group=group,
-            all_media=bool(species_words),
+            media_type="" if species_words else "photo",
             region=region,
         )
         kind = {
