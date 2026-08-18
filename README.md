@@ -22,9 +22,9 @@ Discord bot for eBird and Macaulay Library media.
 | `/alert`, `/alerts`, `/unalert`, `/iam` | dismissable replies only you can see |
 
 In a DM with the bot, results post in place. If your DMs are closed, the
-bot falls back to dismissable replies. Multi-item results (`/top`,
-`/recent`, `/sp`, and `/rare` digests) arrive as one message that pages
-with ◀ ▶ buttons, active for 14 minutes.
+bot falls back to dismissable replies. Multi-item results (`/checklist`,
+`/top`, `/recent`, `/sp`, and `/rare` digests) arrive as one message that
+pages with ◀ ▶ buttons, active for 14 minutes.
 
 ## Photo lookups
 
@@ -33,9 +33,9 @@ with ◀ ▶ buttons, active for 14 minutes.
 /checkmedia ML662698120    (or the asset URL)
 ```
 
-`/checklist`: one message per species; up to four images per card
-(Discord's limit), more continue on image-only cards; metadata from each
-species' first photo only.
+`/checklist`: one paged message, one species per page; up to four images
+per card (Discord's limit), more continue on further cards; metadata from
+each species' first photo only.
 
 `/checkmedia`: all metadata, checklist link, and the asset page's camera
 EXIF (camera, lens, focal length, exposure, aperture, ISO, flash,
@@ -106,9 +106,10 @@ return candidates. Audio and video included (no image in the embed).
 ```
 
 Default output is one digest message, newest first, confirmed and
-unconfirmed both included: a line per report with rarity, date, place and
-county, observer, and checklist link (county omitted when the region
-searched is a county). ⚠️ = awaiting review, 📷 = verified public photo.
+unconfirmed both included, matching what eBird's own Rare Bird Alerts show:
+a line per report with species, date, place and county, observer, and
+checklist link (county omitted when the region searched is a county).
+⚠️ = unconfirmed, 📷 = verified public photo.
 
 - **Region forms**: eBird code (`US`, `US-WA`, `US-WA-033`), state or
   country name, state abbreviation (`WA`), or county + state
@@ -118,6 +119,9 @@ searched is a county). ⚠️ = awaiting review, 📷 = verified public photo.
   Rejected records never appear either way.
 - **`photos:True`**: only reports with a verified photo, one embed each,
   metadata per `detail`.
+- **`rarity:True`**: adds an estimated rarity tier to each report (see
+  **Rarity tiers**). Off by default, since eBird's own alerts have no
+  rarity levels.
 - **`repeats:True`**: allow several reports per species (default: most
   recent of each). `days`: 1 to 30. `count`: 1 to 100 (photo mode caps at
   25), default 10.
@@ -139,7 +143,10 @@ DMs you when a new rare bird is reported in the region, verified or not.
   keyed by checklist + species, so nothing repeats.
 - Rejected records never alert. Each DM shows review status.
 - **`confirmations:True`**: follow-up DM when a pending report is accepted.
-- **`rarity`**: floor, using the `/rare` tiers.
+- **`rarity`**: floor, using the tiers under **Rarity tiers**; only reports
+  that tier or rarer alert.
+- **`show_rarity:True`**: adds the estimated tier to each alert DM (off by
+  default, like eBird's alerts).
 - Subscribing marks the current window as seen (no backlog dump);
   re-subscribing updates settings, keeps history.
 - 3 failed DMs pause a subscription; re-run `/alert` to resume. Max 10 DMs
@@ -148,21 +155,33 @@ DMs you when a new rare bird is reported in the region, verified or not.
   feeds are cached 2 minutes for `/rare`, the poll always fetches fresh.
 - State lives in `bot.db`; restarts never re-send or forget.
 
-### Rarity tiers
+### Rarity tiers (opt-in)
 
-Estimated as the species' share of the region's photos from earlier years
-(current year excluded so fresh megas don't read common):
+eBird's official alerts carry no rarity levels, so by default neither does
+the bot: report output shows species, review status, and media, exactly
+like an RBA entry. The tiers below exist for two opt-in features: the
+`rarity` floor on `/alert`, and the `rarity:True` / `show_rarity:True`
+display options.
 
-| Share of prior photos | Label |
+The estimate is seasonal report frequency, eBird's own kind of measure: of
+~30 sampled days in the same season (±2 weeks around today) across the
+prior 6 years, on what share was the species reported in this region?
+Reviewer-accepted records only; the current year is excluded so a
+much-chased mega can't read as common. A wintering bird flagged in summer
+scores rare *for the season*, matching eBird's season-specific filters.
+
+| Share of sampled season-days | Label |
 |---|---|
-| < 0.005% | 🔴 Mega rarity |
-| < 0.03% | 🟠 Very rare |
-| < 0.12% | 🟡 Rare |
-| < 0.40% | 🟢 Scarce |
-| ≥ 0.40% | ⚪ Locally notable |
+| 0 days | 🔴 Mega rarity |
+| < 7% (1-2 days) | 🟠 Very rare |
+| < 20% | 🟡 Rare |
+| < 45% | 🟢 Scarce |
+| ≥ 45% | ⚪ Locally notable |
 
-Embeds cite the basis ("8 prior photos in US-WA"). Counties score at state
-scale; under 500 prior photos falls back to all-time counts.
+Embeds cite the basis ("reported 2 of 30 season-days since 2020 in
+US-WA-033"). A region is scored at its own scale; only when it had fewer
+than 60 checklists across the sampled days does the baseline escalate to
+the parent region, and the note names the scope actually used.
 
 ## Setup
 
