@@ -1172,6 +1172,9 @@ async def _rarity(
     return "Locally notable", "⚪", share, note
 
 
+species_rarity = _rarity  # public name for callers outside this module
+
+
 def notable_key(obs: dict) -> str:
     """One species on one checklist — the identity of a single rare-bird report."""
     return f"{obs.get('subId') or ''}:{obs.get('speciesCode') or ''}"
