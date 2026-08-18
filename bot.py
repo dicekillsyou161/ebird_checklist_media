@@ -846,16 +846,27 @@ DIGEST_BUDGET = 3900  # leave room under Discord's 4096-char description limit
 MAX_RARE_PHOTO_POSTS = 25  # photo mode is one message per report; digests page instead
 
 
+def place_context(region_code: str, county: str, state: str) -> str:
+    """What locates a report within the queried region: nothing for a county
+    query, the county for a state query, county and state for a country."""
+    depth = region_code.count("-")
+    if depth >= 2:
+        return ""
+    if depth == 1:
+        return county
+    return ", ".join(bit for bit in (county, state) if bit)
+
+
 def build_rare_digest(
     region_code: str, days: int, reports: list[RareReport], show_rarity: bool = False
 ) -> list[discord.Embed]:
     """The reports condensed into text pages, each within Discord's embed cap."""
-    county_region = region_code.count("-") >= 2  # every line would repeat it
     entries: list[str] = []
     for report in reports:
         location = report.location if len(report.location) <= 44 else report.location[:43] + "…"
-        if report.county and not county_region:
-            location = f"{location} ({report.county})" if location else report.county
+        place = place_context(region_code, report.county, report.state)
+        if place:
+            location = f"{location} ({place})" if location else place
         observer = report.observer if len(report.observer) <= 24 else report.observer[:23] + "…"
         context = " · ".join(bit for bit in (report.obs_dt, location, observer) if bit)
         camera = " 📷" if report.details else ""
@@ -1124,6 +1135,9 @@ def build_alert_embed(
         embed.add_field(name="Count", value=str(report.how_many), inline=True)
     if report.location:
         place = f"[{report.location}]({report.map_url})" if report.map_url else report.location
+        context = place_context(subscription.region, report.county, report.state)
+        if context:
+            place = f"{place} ({context})"
         embed.add_field(name="Location", value=place[:1024], inline=False)
     if report.observer:
         embed.add_field(name="Observer", value=report.observer[:1024], inline=True)
@@ -1206,7 +1220,8 @@ async def poll_region(
             if not subscription.wants_rarity(report.rarity_label):
                 # record it anyway, or every poll would rebuild the same report
                 subscription.mark_seen(
-                    key, report.obs_dt, report.status, report.common_name, rarity
+                    key, report.obs_dt, report.status, report.common_name, rarity,
+                    place_context(subscription.region, report.county, report.state),
                 )
                 changed = True
                 continue
@@ -1214,7 +1229,8 @@ async def poll_region(
                 break
             if await deliver_alert(subscription, build_alert_embed(report, subscription, kind)):
                 subscription.mark_seen(
-                    key, report.obs_dt, report.status, report.common_name, rarity
+                    key, report.obs_dt, report.status, report.common_name, rarity,
+                    place_context(subscription.region, report.county, report.state),
                 )
                 subscription.alerts_sent += 1
                 subscription.last_alert = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -1329,6 +1345,9 @@ async def alert_command(
             notable_status(obs),
             species=obs.get("comName") or "",
             rarity=tiers.get(obs.get("speciesCode") or "", ""),
+            place=place_context(
+                code, obs.get("subnational2Name") or "", obs.get("subnational1Name") or ""
+            ),
         )
     store.add(subscription)
     store.save()
@@ -1360,12 +1379,13 @@ async def alert_command(
 
 def seen_line(key: str, value: list[str]) -> str:
     """One remembered report as a digest line for /alerts."""
-    obs_dt, status, species, rarity = value
+    obs_dt, status, species, rarity, place = value
     checklist_id, _, species_code = key.partition(":")
     name = species or species_code or checklist_id
     bits = [
         rarity,
         f"**{name}** {STATUS_MARKS.get(status, '')}".strip(),
+        place,
         obs_dt,
         f"[{checklist_id}](https://ebird.org/checklist/{checklist_id})",
     ]
@@ -1386,21 +1406,41 @@ async def alerts_command(interaction: discord.Interaction) -> None:
         )
         return
 
-    # rows recorded before tiers were stored at seed time have no rarity;
-    # fill them in from the cached season baselines so the list reads uniformly
+    # rows recorded before tiers/places were stored have blanks; fill them in
+    # (tiers from the cached season baselines, places from the notable feed,
+    # which still covers every row because seen rows prune at the window edge)
     filled = False
     async with aiohttp.ClientSession() as session:
         for subscription in mine:
+            feed: dict[str, dict] | None = None
             for key, value in subscription.recent_seen(3):
                 species_code = key.partition(":")[2]
-                if value[3] or not species_code:
-                    continue
-                tier, emoji, share, _ = await species_rarity(
-                    subscription.region, species_code, session
-                )
-                if share is not None:
-                    value[3] = f"{emoji} {tier}".strip()
-                    filled = True
+                if not value[3] and species_code:
+                    tier, emoji, share, _ = await species_rarity(
+                        subscription.region, species_code, session
+                    )
+                    if share is not None:
+                        value[3] = f"{emoji} {tier}".strip()
+                        filled = True
+                if not value[4] and subscription.region.count("-") < 2:
+                    if feed is None:
+                        try:
+                            feed = {
+                                notable_key(obs): obs for obs in await fetch_notable(
+                                    subscription.region, days=ALERT_WINDOW_DAYS,
+                                    session=session,
+                                )
+                            }
+                        except (ChecklistError, aiohttp.ClientError, asyncio.TimeoutError):
+                            feed = {}
+                    obs = feed.get(key)
+                    if obs is not None:
+                        value[4] = place_context(
+                            subscription.region,
+                            obs.get("subnational2Name") or "",
+                            obs.get("subnational1Name") or "",
+                        )
+                        filled = filled or bool(value[4])
     if filled:
         store.save()
 
