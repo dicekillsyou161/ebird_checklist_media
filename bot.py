@@ -457,6 +457,8 @@ def build_embed(
     lines = []
     if photo.sci_name:
         lines.append(f"*{photo.sci_name}*")
+    if photo.type_label:  # audio plays, and video plays in full, at the link
+        lines.append(f"{photo.type_label} · listen/watch at the link")
     lines.append(f"[macaulaylibrary.org/asset/{photo.asset_id}]({photo.asset_url})")
     if checklist_id:
         lines.append(f"[ebird.org/checklist/{checklist_id}](https://ebird.org/checklist/{checklist_id})")
@@ -470,7 +472,8 @@ def build_embed(
         description="\n".join(lines),
         color=EMBED_COLOR,
     )
-    embed.set_image(url=photo.image_url(1200))
+    if photo.has_image:  # the CDN serves stills for photos and video posters
+        embed.set_image(url=photo.image_url(1200))
     embed.set_footer(text=f"ML{photo.asset_id} • © {photo.photographer} • Macaulay Library")
     if verbose:
         for label, value in photo.metadata_fields():
@@ -503,7 +506,7 @@ def build_photo_embed(photo: Photo, *, detail: str | None = None) -> discord.Emb
     """
     embed = build_embed(photo, verbose=detail is None, show_rating=True)
     if detail:
-        stand_in = AssetDetails(photo=photo, media_type="photo", checklist_id="", exif=())
+        stand_in = AssetDetails(photo=photo, media_type=photo.media_type, checklist_id="", exif=())
         for label, value, is_camera in select_fields(stand_in, detail):
             embed.add_field(
                 name=f"📷 {label}" if is_camera else label,
@@ -514,15 +517,18 @@ def build_photo_embed(photo: Photo, *, detail: str | None = None) -> discord.Emb
 
 
 def build_species_messages(
-    photos: list[Photo], *, detail: str | None = None
+    items: list[Photo], *, detail: str | None = None
 ) -> list[list[discord.Embed]]:
     """Embeds for one species, batched into messages.
 
-    Embeds that share a `url` are rendered by Discord as a single card with a
-    grid of images, so a species becomes one message instead of one per photo.
-    Only the first photo contributes metadata; the rest add just their image.
-    Beyond four photos the species spills into further gallery messages.
+    Photo embeds that share a `url` are rendered by Discord as a single card
+    with a grid of images, so a species' photos become one card instead of one
+    embed each; only the first contributes metadata. Audio and video items
+    can't ride in an image grid, so each gets its own embed after the photos.
+    Beyond four photos the species spills into further gallery cards.
     """
+    photos = [item for item in items if item.media_type == "photo"]
+    other = [item for item in items if item.media_type != "photo"]
     messages: list[list[discord.Embed]] = []
     for start in range(0, len(photos), GALLERY_MAX):
         batch = photos[start:start + GALLERY_MAX]
@@ -541,12 +547,15 @@ def build_species_messages(
             extra.set_image(url=photo.image_url(1200))
             embeds.append(extra)
         messages.append(embeds)
+    # audio/video: metadata comes from the item itself, one embed each
+    for item in other:
+        messages.append([build_photo_embed(item, detail=detail)])
     return messages
 
 
 @bot.tree.command(
     name="checklist",
-    description="Post all public Macaulay Library photos from an eBird checklist",
+    description="Post all public Macaulay Library media from an eBird checklist",
 )
 @app_commands.describe(
     checklist="Checklist URL or ID, e.g. S378216909",
@@ -570,8 +579,8 @@ async def checklist_command(
     checklist_url = f"https://ebird.org/checklist/{sub_id}"
     if not photos:
         await delivery.notice(
-            f"No public photos found on <{checklist_url}> — the checklist may be "
-            "private, have no photos yet, or the ID may be wrong."
+            f"No public media found on <{checklist_url}> — the checklist may be "
+            "private, have no media yet, or the ID may be wrong."
         )
         return
 
@@ -579,13 +588,21 @@ async def checklist_command(
     species_count = len({photo.common_name for photo in photos})
     first = photos[0]
     detail_bits = [bit for bit in (first.photographer, first.obs_date, first.location) if bit]
-    plural = "s" if len(photos) != 1 else ""
+    counts = Counter(photo.media_type for photo in photos)
+    if set(counts) == {"photo"}:
+        what = f"{len(photos)} public photo{'s' if len(photos) != 1 else ''}"
+    else:
+        breakdown = ", ".join(
+            f"{counts[kind]} {label}" for kind, label in
+            (("photo", "photos"), ("audio", "audio"), ("video", "video"))
+            if counts.get(kind)
+        )
+        what = f"{len(photos)} public media items ({breakdown})"
     header = (
-        f"**{len(photos)} public photo{plural}** · "
-        f"{species_count} species · {' · '.join(detail_bits)}\n<{checklist_url}>"
+        f"**{what}** · {species_count} species · {' · '.join(detail_bits)}\n<{checklist_url}>"
     )
     if len(photos) > MAX_PHOTOS_POSTED:
-        header += f"\n…showing the first {MAX_PHOTOS_POSTED} photos; the rest are at the link"
+        header += f"\n…showing the first {MAX_PHOTOS_POSTED} items; the rest are at the link"
 
     # one page per species: its photos ride along as gallery cards on that page
     pages: list[list[discord.Embed]] = []
@@ -644,20 +661,16 @@ async def checkmedia_command(
 
 def build_asset_embed(details: AssetDetails, compact_flag: str | None) -> discord.Embed:
     """The /checkmedia-style embed for one asset, honoring the compact flags."""
+    # build_embed knows the media type: photos and video posters get an image,
+    # audio gets a labeled link instead
     if compact_flag:
         embed = build_embed(details.photo, checklist_id=details.checklist_id, show_rating=True)
-        if details.media_type and details.media_type != "photo":
-            embed.set_image(url=None)
         for label, value, is_camera in select_fields(details, compact_flag):
             name = f"📷 {label}" if is_camera else label
             embed.add_field(name=name, value=value[:1024], inline=True)
         return embed
 
     embed = build_embed(details.photo, verbose=True)
-    if details.media_type and details.media_type != "photo":
-        # audio/video assets have no still image; the link plays the media
-        embed.set_image(url=None)
-        embed.add_field(name="Media type", value=details.media_type, inline=True)
     if details.checklist_id:
         embed.add_field(
             name="Checklist",
@@ -674,6 +687,21 @@ def build_asset_embed(details: AssetDetails, compact_flag: str | None) -> discor
     return embed
 
 
+MEDIA_CHOICES = [
+    app_commands.Choice(name="Photos", value="photo"),
+    app_commands.Choice(name="Audio", value="audio"),
+    app_commands.Choice(name="Video", value="video"),
+    app_commands.Choice(name="All media", value="all"),
+]
+MEDIA_WORDS = {"photo": "photos", "audio": "audio recordings", "video": "videos", "": "media"}
+
+
+def media_value(choice: app_commands.Choice[str] | None, default: str) -> str:
+    """The mediaType the API expects; empty string means every kind."""
+    value = choice.value if choice else default
+    return "" if value == "all" else value
+
+
 async def _send_user_photos(
     interaction: discord.Interaction,
     user: str,
@@ -683,6 +711,7 @@ async def _send_user_photos(
     species: str = "",
     species_group: bool = False,
     region: str = "",
+    media_type: str = "photo",
     compact_flag: str | None = None,
     delivery: Delivery | None = None,
 ) -> None:
@@ -696,7 +725,7 @@ async def _send_user_photos(
             include_exif=compact_flag != COMPACT_FLAG,
             species_query=species or None,
             species_group=species_group,
-            all_media=bool(species),
+            media_type=media_type,
             region=region,
         )
     except ChecklistError as error:
@@ -720,8 +749,8 @@ async def _send_user_photos(
     catalog = f"https://media.ebird.org/catalog?sort={sort}"
     if result.user_id:
         catalog += f"&userId={result.user_id}"
-    if not species:
-        catalog += "&mediaType=photo"
+    if media_type:
+        catalog += f"&mediaType={media_type}"
     if result.species_code:
         catalog += f"&taxonCode={result.species_code}"
     if result.region:
@@ -759,9 +788,10 @@ async def _send_user_photos(
     count="How many to post (1–50, default 10)",
     group="Match every species with this in its name (e.g. all puffins; global if no user)",
     region="Limit species matches and media to a region — code (US-WA) or name (washington)",
+    media="Media type to search (default: all media)",
     detail=DETAIL_HELP,
 )
-@app_commands.choices(detail=DETAIL_CHOICES)
+@app_commands.choices(detail=DETAIL_CHOICES, media=MEDIA_CHOICES)
 async def sp_command(
     interaction: discord.Interaction,
     species: str,
@@ -769,30 +799,35 @@ async def sp_command(
     count: app_commands.Range[int, 1, 50] = 10,
     group: bool = False,
     region: str = "",
+    media: app_commands.Choice[str] | None = None,
     detail: app_commands.Choice[str] | None = None,
 ) -> None:
     delivery = await defer_privately(interaction)
+    media_type = media_value(media, "all")
     await _send_user_photos(
-        interaction, user, count, SORT_BEST, "Top {n} media for {sp}",
-        species=species, species_group=group, region=region,
+        interaction, user, count, SORT_BEST,
+        f"Top {{n}} highest rated {MEDIA_WORDS[media_type]} for {{sp}}",
+        species=species, species_group=group, region=region, media_type=media_type,
         compact_flag=detail_flag(detail), delivery=delivery,
     )
 
 
 @bot.tree.command(
     name="top",
-    description="Post an eBird user's top highest-rated photos",
+    description="Post an eBird user's highest-rated photos (or audio/video)",
 )
 @app_commands.describe(
     user="Their USER… ID, name, @mention, or ML asset link; omit for your own (see /iam)",
-    count="How many photos to post (1–50, default 10)",
+    count="How many to post (1–50, default 10)",
+    media="Media type to pull (default: photos)",
     detail=DETAIL_HELP,
 )
-@app_commands.choices(detail=DETAIL_CHOICES)
+@app_commands.choices(detail=DETAIL_CHOICES, media=MEDIA_CHOICES)
 async def top_command(
     interaction: discord.Interaction,
     user: str = "",
     count: app_commands.Range[int, 1, 50] = 10,
+    media: app_commands.Choice[str] | None = None,
     detail: app_commands.Choice[str] | None = None,
 ) -> None:
     delivery = await defer_privately(interaction)
@@ -800,28 +835,32 @@ async def top_command(
     if not whose:
         await delivery.notice(NO_USER_LINKED)
         return
+    media_type = media_value(media, "photo")
     await _send_user_photos(
-        interaction, whose, count, SORT_BEST, "Top {n} rated photos",
-        compact_flag=detail_flag(detail), delivery=delivery,
+        interaction, whose, count, SORT_BEST,
+        f"Top {{n}} highest rated {MEDIA_WORDS[media_type]}",
+        media_type=media_type, compact_flag=detail_flag(detail), delivery=delivery,
     )
 
 
 @bot.tree.command(
     name="recent",
-    description="Post an eBird user's most recently uploaded photos",
+    description="Post an eBird user's most recently uploaded photos (or audio/video)",
 )
 @app_commands.describe(
     user="Their USER… ID, name, @mention, or ML asset link; omit for your own (see /iam)",
-    count="How many photos to post (1–50, default 10)",
+    count="How many to post (1–50, default 10)",
     obs="Sort by observation date/time instead of upload date",
+    media="Media type to pull (default: photos)",
     detail=DETAIL_HELP,
 )
-@app_commands.choices(detail=DETAIL_CHOICES)
+@app_commands.choices(detail=DETAIL_CHOICES, media=MEDIA_CHOICES)
 async def recent_command(
     interaction: discord.Interaction,
     user: str = "",
     count: app_commands.Range[int, 1, 50] = 10,
     obs: bool = False,
+    media: app_commands.Choice[str] | None = None,
     detail: app_commands.Choice[str] | None = None,
 ) -> None:
     delivery = await defer_privately(interaction)
@@ -830,15 +869,19 @@ async def recent_command(
         await delivery.notice(NO_USER_LINKED)
         return
     flag = detail_flag(detail)
+    media_type = media_value(media, "photo")
+    kind = MEDIA_WORDS[media_type]
     if obs:
         await _send_user_photos(
-            interaction, whose, count, SORT_OBS, "{n} most recent photos by observation date",
-            compact_flag=flag, delivery=delivery,
+            interaction, whose, count, SORT_OBS,
+            f"{{n}} most recent {kind} by observation date",
+            media_type=media_type, compact_flag=flag, delivery=delivery,
         )
     else:
         await _send_user_photos(
-            interaction, whose, count, SORT_RECENT, "{n} most recently uploaded photos",
-            compact_flag=flag, delivery=delivery,
+            interaction, whose, count, SORT_RECENT,
+            f"{{n}} most recently uploaded {kind}",
+            media_type=media_type, compact_flag=flag, delivery=delivery,
         )
 
 
