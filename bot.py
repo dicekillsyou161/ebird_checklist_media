@@ -773,7 +773,7 @@ async def sp_command(
 ) -> None:
     delivery = await defer_privately(interaction)
     await _send_user_photos(
-        interaction, user, count, SORT_BEST, "{n} media of {sp}",
+        interaction, user, count, SORT_BEST, "Top {n} media for {sp}",
         species=species, species_group=group, region=region,
         compact_flag=detail_flag(detail), delivery=delivery,
     )
