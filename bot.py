@@ -631,16 +631,17 @@ async def checklist_command(
             page_urls.append(urls)
         posted += len(allowed)
 
-    # at most 3 players per page: link unfurls share the 10-embed message cap
-    contents = [
-        header + ("\n" + "\n".join(urls[:3]) if urls else "")
-        for urls in page_urls
-    ]
+    # at most 3 player links per page's companion message
+    players = ["\n".join(urls[:3]) for urls in page_urls]
     if len(pages) == 1:
-        await delivery.send(content=contents[0], embeds=pages[0])
+        await delivery.send(content=header, embeds=pages[0])
+        if players[0]:
+            await delivery.send(content=players[0])  # bare links -> inline players
     else:
-        pager = EmbedPager(pages, interaction.user.id, contents=contents)
-        pager.message = await delivery.send(content=contents[0], embeds=pages[0], view=pager)
+        pager = EmbedPager(pages, interaction.user.id, players=players)
+        pager.message = await delivery.send(content=header, embeds=pages[0], view=pager)
+        if any(players):
+            pager.player_message = await delivery.send(content=pager.player_content(0))
     await delivery.finish(
         f"Sent {posted} photo(s) from `{sub_id}` to your DMs"
         + (" as one paged message." if len(pages) > 1 else ".")
@@ -671,11 +672,11 @@ async def checkmedia_command(
         return
 
     learn_names([(details.photo.photographer, details.photo.user_id)])
-    # a bare direct-file link makes Discord attach its own inline player
-    await interaction.followup.send(
-        content=details.photo.media_url or None,
-        embed=build_asset_embed(details, compact_flag),
-    )
+    await interaction.followup.send(embed=build_asset_embed(details, compact_flag))
+    if details.photo.media_url:
+        # Discord only unfurls links in messages without bot embeds, so the
+        # player link goes in its own bare message right under the card
+        await interaction.followup.send(content=details.photo.media_url)
 
 
 def build_asset_embed(details: AssetDetails, compact_flag: str | None) -> discord.Embed:
@@ -785,20 +786,20 @@ async def _send_user_photos(
             page = f"{number}/{len(pages)}"
             embed.set_footer(text=f"{footer} · {page}" if footer else page)
     header_text = " · ".join(bits)
-    # audio/video pages carry the direct file link, which Discord renders
-    # as an inline player under the header
-    contents = [
-        header_text + (f"\n{d.photo.media_url}" if d.photo.media_url else "")
-        for d in result.details
-    ]
+    players = [d.photo.media_url for d in result.details]
     if len(pages) == 1:
-        await delivery.send(content=contents[0], embed=pages[0])
+        await delivery.send(content=header_text, embed=pages[0])
+        if players[0]:
+            await delivery.send(content=players[0])  # bare link -> inline player
         await delivery.finish("Sent 1 item to your DMs.")
         return
-    pager = EmbedPager(pages, interaction.user.id, contents=contents)
+    pager = EmbedPager(pages, interaction.user.id, players=players)
     pager.message = await delivery.send(
-        content=contents[0], embed=pages[0], view=pager
+        content=header_text, embed=pages[0], view=pager
     )
+    if any(players):
+        # companion under the results; the pager keeps it on the current page
+        pager.player_message = await delivery.send(content=pager.player_content(0))
     await delivery.finish(
         f"Sent {len(pages)} item(s) to your DMs as one paged message."
     )
@@ -997,23 +998,33 @@ class EmbedPager(discord.ui.View):
     a single page.
     """
 
+    PLAYER_PLACEHOLDER = "-# (no audio or video on this page)"
+
     def __init__(
         self,
         pages: list[discord.Embed | list[discord.Embed]],
         owner_id: int,
         contents: list[str] | None = None,
+        players: list[str] | None = None,
     ) -> None:
         super().__init__(timeout=PAGER_TIMEOUT)
         self.pages = [
             [page] if isinstance(page, discord.Embed) else list(page) for page in pages
         ]
-        # optional per-page message content (e.g. a direct video link Discord
-        # renders as a player); None leaves content untouched on page flips
+        # optional per-page message content; None leaves content untouched
         self.contents = contents
+        # per-page direct audio/video file links ("" = none). They live in a
+        # companion message below the results, because Discord only renders
+        # players for links in messages that carry no bot embeds.
+        self.players = players
+        self.player_message: discord.Message | None = None
         self.owner_id = owner_id
         self.index = 0
         self.message: discord.Message | None = None
         self._sync()
+
+    def player_content(self, index: int) -> str:
+        return (self.players and self.players[index]) or self.PLAYER_PLACEHOLDER
 
     def _sync(self) -> None:
         self.back.disabled = self.index == 0
@@ -1029,6 +1040,11 @@ class EmbedPager(discord.ui.View):
         if self.contents is not None:
             kwargs["content"] = self.contents[self.index]
         await interaction.response.edit_message(**kwargs)
+        if self.player_message is not None:
+            try:
+                await self.player_message.edit(content=self.player_content(self.index))
+            except discord.HTTPException:
+                pass  # the companion may be gone; paging still works
 
     @discord.ui.button(label="◀ Back", style=discord.ButtonStyle.secondary)
     async def back(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
