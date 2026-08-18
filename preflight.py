@@ -86,6 +86,23 @@ try:
         "files may be from different versions",
     )
     check("database bot.db opened", (HERE / "bot.db").is_file(), "not created")
+    import alerts as alerts_module
+    import db as db_module
+
+    conn = db_module.connect(HERE / "bot.db")
+    for table, needed in (
+        ("subscriptions", {c.strip() for c in alerts_module._SUB_COLUMNS.split(",")}),
+        ("seen", {"user_id", "region", "key", "obs_dt", "status", "species", "rarity"}),
+    ):
+        have = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        missing = needed - have
+        check(
+            f"{table} table has every column the code writes",
+            not missing,
+            f"missing {', '.join(sorted(missing))}; db.py is older than the other "
+            "files, so its schema upgrades never ran. Deploy all *.py together.",
+        )
+    conn.close()
     leftovers = [
         name for name in ("aliases.json", "subscriptions.json") if (HERE / name).exists()
     ]
