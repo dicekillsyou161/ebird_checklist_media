@@ -50,6 +50,7 @@ from ebird_media import (
     region_name,
     resolve_region_code,
     select_fields,
+    species_rarity,
 )
 
 load_dotenv()
@@ -1300,6 +1301,14 @@ async def alert_command(
             # seed with everything already in the window, so subscribing doesn't
             # dump days of backlog into the user's DMs
             backlog = await fetch_notable(code, days=ALERT_WINDOW_DAYS, session=session)
+            # tier each seeded species now so /alerts can show it later; one
+            # cached baseline fetch, then the per-species lookups are free
+            tiers: dict[str, str] = {}
+            for species_code in {o.get("speciesCode") for o in backlog}:
+                if not species_code:
+                    continue
+                tier, emoji, share, _ = await species_rarity(code, species_code, session)
+                tiers[species_code] = f"{emoji} {tier}".strip() if share is not None else ""
     except ChecklistError as error:
         await interaction.followup.send(str(error), ephemeral=True)
         return
@@ -1319,6 +1328,7 @@ async def alert_command(
             obs.get("obsDt") or "",
             notable_status(obs),
             species=obs.get("comName") or "",
+            rarity=tiers.get(obs.get("speciesCode") or "", ""),
         )
     store.add(subscription)
     store.save()
@@ -1375,6 +1385,25 @@ async def alerts_command(interaction: discord.Interaction) -> None:
             ephemeral=True,
         )
         return
+
+    # rows recorded before tiers were stored at seed time have no rarity;
+    # fill them in from the cached season baselines so the list reads uniformly
+    filled = False
+    async with aiohttp.ClientSession() as session:
+        for subscription in mine:
+            for key, value in subscription.recent_seen(3):
+                species_code = key.partition(":")[2]
+                if value[3] or not species_code:
+                    continue
+                tier, emoji, share, _ = await species_rarity(
+                    subscription.region, species_code, session
+                )
+                if share is not None:
+                    value[3] = f"{emoji} {tier}".strip()
+                    filled = True
+    if filled:
+        store.save()
+
     blocks = []
     for subscription in sorted(mine, key=lambda s: s.region):
         bits = [subscription.rarity_label, f"{subscription.alerts_sent} sent"]
