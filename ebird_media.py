@@ -334,19 +334,29 @@ async def _search(session: aiohttp.ClientSession, **params) -> list[dict]:
     """One call to the media search API, returning the raw item list."""
     headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
     query = {key: str(value) for key, value in params.items()}
-    async with session.get(
-        API_URL, params=query, headers=headers, timeout=aiohttp.ClientTimeout(total=25)
-    ) as resp:
-        if resp.status != 200:
-            raise ChecklistError(
-                f"Macaulay Library search returned HTTP {resp.status} — try again in a minute."
-            )
-        if "json" not in (resp.headers.get("Content-Type") or ""):
-            raise ChecklistError(
-                "Macaulay Library returned a non-JSON response "
-                "(possibly an anti-bot challenge — see README notes on the User-Agent)."
-            )
-        page = await resp.json()
+    for attempt in range(2):  # one retry on 5xx: transient load-shedding is common
+        async with session.get(
+            API_URL, params=query, headers=headers, timeout=aiohttp.ClientTimeout(total=25)
+        ) as resp:
+            if resp.status >= 500 and attempt == 0:
+                await asyncio.sleep(2)
+                continue
+            if resp.status >= 500:
+                raise ChecklistError(
+                    f"Macaulay Library is temporarily unavailable (HTTP {resp.status}) "
+                    "— try again shortly."
+                )
+            if resp.status != 200:
+                raise ChecklistError(
+                    f"Macaulay Library search returned HTTP {resp.status} — try again in a minute."
+                )
+            if "json" not in (resp.headers.get("Content-Type") or ""):
+                raise ChecklistError(
+                    "Macaulay Library returned a non-JSON response "
+                    "(possibly an anti-bot challenge — see README notes on the User-Agent)."
+                )
+            page = await resp.json()
+            break
     if not isinstance(page, list):
         raise ChecklistError("Unexpected response shape from Macaulay Library search.")
     return page
@@ -1259,18 +1269,28 @@ async def fetch_notable(
     if owns_session:
         session = aiohttp.ClientSession()
     try:
-        async with session.get(
-            NOTABLE_URL.format(region_code=region_code),
-            params={"key": EBIRD_WEB_KEY, "back": str(days), "detail": "full"},
-            headers={"Accept": "application/json", "User-Agent": USER_AGENT},
-            timeout=aiohttp.ClientTimeout(total=30),
-        ) as resp:
-            if resp.status != 200:
-                raise ChecklistError(
-                    f"eBird returned HTTP {resp.status} for notable sightings in "
-                    f"`{region_code}` — check the region."
-                )
-            observations = await resp.json(content_type=None)
+        for attempt in range(3):  # 5xx = eBird shedding load; brief backoff, retry
+            async with session.get(
+                NOTABLE_URL.format(region_code=region_code),
+                params={"key": EBIRD_WEB_KEY, "back": str(days), "detail": "full"},
+                headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as resp:
+                if resp.status >= 500:
+                    if attempt < 2:
+                        await asyncio.sleep(2 * (attempt + 1))
+                        continue
+                    raise ChecklistError(
+                        f"eBird's API is temporarily unavailable (HTTP {resp.status}) "
+                        "— try again shortly."
+                    )
+                if resp.status != 200:
+                    raise ChecklistError(
+                        f"eBird returned HTTP {resp.status} for notable sightings in "
+                        f"`{region_code}` — check the region."
+                    )
+                observations = await resp.json(content_type=None)
+                break
     except (aiohttp.ClientError, asyncio.TimeoutError) as error:
         raise ChecklistError(f"Couldn't reach eBird ({error.__class__.__name__}).") from error
     finally:
