@@ -129,6 +129,12 @@ class Subscription:
         return None
 
     def wants_rarity(self, label: str) -> bool:
+        # At state or country scale, "Locally notable" reports are noise: a
+        # common bird tripping one county's filter. Only that exact label is
+        # dropped; an unknown tier ("Notable sighting") still alerts, so a
+        # rarity-scoring outage can't silently mute a whole subscription.
+        if label == "Locally notable" and self.region.count("-") < 2:
+            return False
         return RARITY_RANK.get(label, 0) >= self.min_rarity
 
     def mark_seen(
