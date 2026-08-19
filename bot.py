@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 import db
 from alerts import (
     CONFIRMATION,
+    NEW_REPORT,
     RARITY_LEVELS,
     STATUS_MARKS,
     AlertStore,
@@ -27,6 +28,7 @@ from ebird_media import (
     COMPACT_BRIEF_FLAG,
     COMPACT_CAMERA_FLAG,
     COMPACT_FLAG,
+    STATUS_CONFIRMED,
     STATUS_PENDING,
     STATUS_REJECTED,
     AssetDetails,
@@ -1602,6 +1604,127 @@ async def unalert_command(interaction: discord.Interaction, region: str = "") ->
     await interaction.followup.send(
         f"Stopped alerts for **{dropped.display_region}** (`{code}`).", ephemeral=True
     )
+
+
+def build_seen_embed(subscription: Subscription, key: str, value: list[str]) -> discord.Embed:
+    """An alert rebuilt from the stored crumbs, for reports gone from the feed."""
+    obs_dt, status, species, rarity, place = value
+    checklist_id, _, species_code = key.partition(":")
+    lines = []
+    if subscription.show_rarity and rarity:
+        lines.append(rarity)
+    embed = discord.Embed(
+        title=species or species_code or checklist_id,
+        url=f"https://ebird.org/checklist/{checklist_id}",
+        description="\n".join(lines),
+        color=EMBED_COLOR,
+    )
+    embed.add_field(
+        name="Status",
+        value="✅ Confirmed" if status == STATUS_CONFIRMED else "⏳ Unconfirmed",
+        inline=True,
+    )
+    if obs_dt:
+        embed.add_field(name="Observed", value=obs_dt, inline=True)
+    if place:
+        embed.add_field(name="County", value=place, inline=True)
+    embed.add_field(
+        name="Checklist",
+        value=f"[{checklist_id}](https://ebird.org/checklist/{checklist_id})",
+        inline=True,
+    )
+    embed.set_footer(text=f"{subscription.display_region} · /unalert to stop")
+    return embed
+
+
+@bot.tree.command(
+    name="repeat",
+    description="Repost the latest rare bird report for each region you watch",
+)
+@app_commands.describe(
+    region="One watched region to resend (pick from the menu; empty = all of them)",
+)
+async def repeat_command(interaction: discord.Interaction, region: str = "") -> None:
+    await interaction.response.defer(ephemeral=True)
+    mine = store.for_user(str(interaction.user.id))
+    if not mine:
+        await interaction.followup.send(
+            "No alert subscriptions yet. Start one with `/alert region:king county wa`.",
+            ephemeral=True,
+        )
+        return
+    if region.strip():
+        code = region.strip().upper()
+        chosen = [s for s in mine if s.region == code]
+        if not chosen:  # typed by hand rather than picked: match the label too
+            low = region.strip().lower()
+            chosen = [s for s in mine if low in s.display_region.lower()]
+        if not chosen:
+            await interaction.followup.send(
+                f"You aren't watching `{region.strip()}`. `/alerts` lists your "
+                "subscriptions.",
+                ephemeral=True,
+            )
+            return
+        mine = chosen
+    lines = []
+    async with aiohttp.ClientSession() as session:
+        for subscription in sorted(mine, key=lambda s: s.region):
+            embed = None
+            resent = ""
+            # newest first; skip anything reviewers have since rejected
+            for key, value in subscription.recent_seen(10):
+                if value[1] == STATUS_REJECTED:
+                    continue
+                try:
+                    observations = await fetch_notable(
+                        subscription.region, days=ALERT_WINDOW_DAYS, session=session
+                    )
+                    obs = next(
+                        (o for o in observations if notable_key(o) == key), None
+                    )
+                    if obs is not None and notable_status(obs) == STATUS_REJECTED:
+                        continue  # stored as pending, rejected since
+                    if obs is not None:
+                        pairs = await attach_photos([obs], session=session)
+                        reports = await build_rare_reports(
+                            subscription.region, pairs, session=session
+                        )
+                        if reports:
+                            embed = build_alert_embed(reports[0], subscription, NEW_REPORT)
+                except (ChecklistError, aiohttp.ClientError, asyncio.TimeoutError):
+                    pass  # feed unavailable; fall back to what's stored
+                if embed is None:
+                    embed = build_seen_embed(subscription, key, value)
+                resent = value[2] or key.partition(":")[2]
+                break
+            if embed is None:
+                lines.append(f"**{subscription.display_region}**: no reports on record yet")
+                continue
+            footer = embed.footer.text or ""
+            embed.set_footer(text=f"{footer} · resent by /repeat")
+            if await deliver_alert(subscription, embed):
+                lines.append(f"**{subscription.display_region}**: resent {resent}")
+            else:
+                lines.append(
+                    f"**{subscription.display_region}**: couldn't DM you — check your "
+                    "privacy settings"
+                )
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+@repeat_command.autocomplete("region")
+async def repeat_region_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Offer the invoker's own subscribed regions as menu choices."""
+    needle = current.strip().lower()
+    choices = []
+    for sub in sorted(store.for_user(str(interaction.user.id)), key=lambda s: s.region):
+        label = f"{sub.display_region} ({sub.region})"
+        if needle in label.lower():
+            choices.append(app_commands.Choice(name=label[:100], value=sub.region))
+    return choices[:25]  # Discord's autocomplete limit
 
 
 def main() -> None:
