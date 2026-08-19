@@ -1269,6 +1269,29 @@ async def deliver_alert(subscription: Subscription, embed: discord.Embed) -> boo
         return False
 
 
+async def deliver_alert_pages(
+    subscription: Subscription, pages: list[discord.Embed], owner_id: int
+) -> bool:
+    """DM a batch of alerts as one paged message; False when Discord wouldn't take it."""
+    if not pages:
+        return False
+    try:
+        user = bot.get_user(int(subscription.user_id))
+        if user is None:
+            user = await bot.fetch_user(int(subscription.user_id))
+        if len(pages) == 1:
+            await user.send(embed=pages[0])
+            return True
+        pager = EmbedPager(pages, owner_id)
+        pager.message = await user.send(embed=pages[0], view=pager)
+        return True
+    except (discord.Forbidden, discord.NotFound):
+        return False  # DMs closed, or the account is gone
+    except (discord.HTTPException, ValueError, AttributeError) as error:
+        print(f"Alert DM to {subscription.user_id} failed: {error!r}")
+        return False
+
+
 async def poll_region(
     region: str, subscriptions: list[Subscription], session: aiohttp.ClientSession
 ) -> bool:
@@ -1744,9 +1767,10 @@ async def repeat_command(
                     }
                 except (ChecklistError, aiohttp.ClientError, asyncio.TimeoutError):
                     pass
-            sent = 0
+            # `picked` is newest first, so page 1 is the latest report
+            pages: list[discord.Embed] = []
             names: list[str] = []
-            for key, value in reversed(picked):  # oldest first, like the poll
+            for key, value in picked:
                 report = reports_by_key.get(key)
                 if report is not None:
                     embed = build_alert_embed(report, subscription, NEW_REPORT)
@@ -1754,14 +1778,14 @@ async def repeat_command(
                     embed = build_seen_embed(subscription, key, value)
                 footer = embed.footer.text or ""
                 embed.set_footer(text=f"{footer} · resent by /repeat")
-                if not await deliver_alert(subscription, embed):
-                    break  # stop hammering a mailbox that is not accepting DMs
-                sent += 1
+                pages.append(embed)
                 names.append(value[2] or key.partition(":")[2])
-            if sent:
+            if await deliver_alert_pages(subscription, pages, interaction.user.id):
                 shown = ", ".join(names[:4]) + ("…" if len(names) > 4 else "")
+                page_note = " as one paged message" if len(pages) > 1 else ""
                 lines.append(
-                    f"**{subscription.display_region}**: resent {sent} report(s): {shown}"
+                    f"**{subscription.display_region}**: resent {len(pages)} "
+                    f"report(s){page_note}: {shown}"
                 )
             else:
                 lines.append(
