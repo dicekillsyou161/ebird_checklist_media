@@ -1644,11 +1644,13 @@ def build_seen_embed(subscription: Subscription, key: str, value: list[str]) -> 
 @app_commands.describe(
     region="One watched region to resend (pick from the menu; empty = all of them)",
     count="How many recent reports per region to resend (1–10, default 1)",
+    photos="Only the last X reports with a verified public photo",
 )
 async def repeat_command(
     interaction: discord.Interaction,
     region: str = "",
     count: app_commands.Range[int, 1, 10] = 1,
+    photos: bool = False,
 ) -> None:
     await interaction.response.defer(ephemeral=True)
     mine = store.for_user(str(interaction.user.id))
@@ -1684,10 +1686,13 @@ async def repeat_command(
             except (ChecklistError, aiohttp.ClientError, asyncio.TimeoutError):
                 feed = {}  # feed unavailable; everything falls back to stored crumbs
             # newest first; skip rejected reports and tiers this subscription
-            # wouldn't alert on (stored rarity reads "⚪ Locally notable")
+            # wouldn't alert on (stored rarity reads "⚪ Locally notable").
+            # In photo mode, over-collect flagged candidates: hasRichMedia is
+            # only a hint, so the real photo check comes after.
+            want = count if not photos else min(max(count * 3, 12), 24)
             picked: list[tuple[str, list[str]]] = []
             for key, value in subscription.recent_seen(len(subscription.seen)):
-                if len(picked) >= count:
+                if len(picked) >= want:
                     break
                 if value[1] == STATUS_REJECTED:
                     continue
@@ -1697,16 +1702,40 @@ async def repeat_command(
                 obs = feed.get(key)
                 if obs is not None and notable_status(obs) == STATUS_REJECTED:
                     continue  # stored as pending, rejected since
+                if photos and (obs is None or not obs.get("hasRichMedia")):
+                    continue  # photo mode: must be in the window and flagged
                 picked.append((key, value))
             if not picked:
-                lines.append(f"**{subscription.display_region}**: no reports on record yet")
+                lines.append(
+                    f"**{subscription.display_region}**: "
+                    + ("no recent reports with a photo" if photos
+                       else "no reports on record yet")
+                )
                 continue
             # rebuild everything still in the feed in one batch
             reports_by_key: dict[str, RareReport] = {}
             in_feed = [feed[key] for key, _ in picked if key in feed]
+            pairs: list = []
             if in_feed:
                 try:
                     pairs = await attach_photos(in_feed, session=session)
+                except (ChecklistError, aiohttp.ClientError, asyncio.TimeoutError):
+                    pairs = []
+            if photos:
+                # keep only reports whose photo really is indexed and public
+                with_photo = {
+                    notable_key(obs) for obs, item in pairs if item is not None
+                }
+                picked = [(k, v) for k, v in picked if k in with_photo][:count]
+                kept = {k for k, _ in picked}
+                pairs = [(obs, item) for obs, item in pairs if notable_key(obs) in kept]
+                if not picked:
+                    lines.append(
+                        f"**{subscription.display_region}**: no recent reports with a photo"
+                    )
+                    continue
+            if pairs:
+                try:
                     built = await build_rare_reports(
                         subscription.region, pairs, session=session
                     )
