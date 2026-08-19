@@ -1672,9 +1672,13 @@ async def repeat_command(interaction: discord.Interaction, region: str = "") -> 
         for subscription in sorted(mine, key=lambda s: s.region):
             embed = None
             resent = ""
-            # newest first; skip anything reviewers have since rejected
+            # newest first; skip rejected reports and tiers this subscription
+            # wouldn't alert on (stored rarity reads "⚪ Locally notable")
             for key, value in subscription.recent_seen(10):
                 if value[1] == STATUS_REJECTED:
+                    continue
+                stored_tier = value[3].partition(" ")[2] if value[3] else ""
+                if stored_tier and not subscription.wants_rarity(stored_tier):
                     continue
                 try:
                     observations = await fetch_notable(
