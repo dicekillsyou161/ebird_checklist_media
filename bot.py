@@ -1643,8 +1643,13 @@ def build_seen_embed(subscription: Subscription, key: str, value: list[str]) -> 
 )
 @app_commands.describe(
     region="One watched region to resend (pick from the menu; empty = all of them)",
+    count="How many recent reports per region to resend (1–10, default 1)",
 )
-async def repeat_command(interaction: discord.Interaction, region: str = "") -> None:
+async def repeat_command(
+    interaction: discord.Interaction,
+    region: str = "",
+    count: app_commands.Range[int, 1, 10] = 1,
+) -> None:
     await interaction.response.defer(ephemeral=True)
     mine = store.for_user(str(interaction.user.id))
     if not mine:
@@ -1670,45 +1675,65 @@ async def repeat_command(interaction: discord.Interaction, region: str = "") -> 
     lines = []
     async with aiohttp.ClientSession() as session:
         for subscription in sorted(mine, key=lambda s: s.region):
-            embed = None
-            resent = ""
+            try:
+                feed = {
+                    notable_key(obs): obs for obs in await fetch_notable(
+                        subscription.region, days=ALERT_WINDOW_DAYS, session=session
+                    )
+                }
+            except (ChecklistError, aiohttp.ClientError, asyncio.TimeoutError):
+                feed = {}  # feed unavailable; everything falls back to stored crumbs
             # newest first; skip rejected reports and tiers this subscription
             # wouldn't alert on (stored rarity reads "⚪ Locally notable")
-            for key, value in subscription.recent_seen(10):
+            picked: list[tuple[str, list[str]]] = []
+            for key, value in subscription.recent_seen(len(subscription.seen)):
+                if len(picked) >= count:
+                    break
                 if value[1] == STATUS_REJECTED:
                     continue
                 stored_tier = value[3].partition(" ")[2] if value[3] else ""
                 if stored_tier and not subscription.wants_rarity(stored_tier):
                     continue
-                try:
-                    observations = await fetch_notable(
-                        subscription.region, days=ALERT_WINDOW_DAYS, session=session
-                    )
-                    obs = next(
-                        (o for o in observations if notable_key(o) == key), None
-                    )
-                    if obs is not None and notable_status(obs) == STATUS_REJECTED:
-                        continue  # stored as pending, rejected since
-                    if obs is not None:
-                        pairs = await attach_photos([obs], session=session)
-                        reports = await build_rare_reports(
-                            subscription.region, pairs, session=session
-                        )
-                        if reports:
-                            embed = build_alert_embed(reports[0], subscription, NEW_REPORT)
-                except (ChecklistError, aiohttp.ClientError, asyncio.TimeoutError):
-                    pass  # feed unavailable; fall back to what's stored
-                if embed is None:
-                    embed = build_seen_embed(subscription, key, value)
-                resent = value[2] or key.partition(":")[2]
-                break
-            if embed is None:
+                obs = feed.get(key)
+                if obs is not None and notable_status(obs) == STATUS_REJECTED:
+                    continue  # stored as pending, rejected since
+                picked.append((key, value))
+            if not picked:
                 lines.append(f"**{subscription.display_region}**: no reports on record yet")
                 continue
-            footer = embed.footer.text or ""
-            embed.set_footer(text=f"{footer} · resent by /repeat")
-            if await deliver_alert(subscription, embed):
-                lines.append(f"**{subscription.display_region}**: resent {resent}")
+            # rebuild everything still in the feed in one batch
+            reports_by_key: dict[str, RareReport] = {}
+            in_feed = [feed[key] for key, _ in picked if key in feed]
+            if in_feed:
+                try:
+                    pairs = await attach_photos(in_feed, session=session)
+                    built = await build_rare_reports(
+                        subscription.region, pairs, session=session
+                    )
+                    reports_by_key = {
+                        f"{r.checklist_id}:{r.species_code}": r for r in built
+                    }
+                except (ChecklistError, aiohttp.ClientError, asyncio.TimeoutError):
+                    pass
+            sent = 0
+            names: list[str] = []
+            for key, value in reversed(picked):  # oldest first, like the poll
+                report = reports_by_key.get(key)
+                if report is not None:
+                    embed = build_alert_embed(report, subscription, NEW_REPORT)
+                else:
+                    embed = build_seen_embed(subscription, key, value)
+                footer = embed.footer.text or ""
+                embed.set_footer(text=f"{footer} · resent by /repeat")
+                if not await deliver_alert(subscription, embed):
+                    break  # stop hammering a mailbox that is not accepting DMs
+                sent += 1
+                names.append(value[2] or key.partition(":")[2])
+            if sent:
+                shown = ", ".join(names[:4]) + ("…" if len(names) > 4 else "")
+                lines.append(
+                    f"**{subscription.display_region}**: resent {sent} report(s): {shown}"
+                )
             else:
                 lines.append(
                     f"**{subscription.display_region}**: couldn't DM you — check your "
