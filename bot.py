@@ -49,6 +49,9 @@ from ebird_media import (
     notable_status,
     parse_asset_id,
     parse_checklist_id,
+    MEDIA_AGES,
+    MEDIA_SEXES,
+    MEDIA_TAGS,
     region_name,
     resolve_region_code,
     select_fields,
@@ -717,6 +720,32 @@ MEDIA_CHOICES = [
 ]
 MEDIA_WORDS = {"photo": "photos", "audio": "audio recordings", "video": "videos", "": "media"}
 
+# Search filters the Macaulay API honors, with readable labels. Tag values cover
+# behavior and content both; Discord allows 25 choices per option and there are 23.
+TAG_LABELS = {
+    "nest": "Nest", "egg": "Eggs", "nest_building": "Nest building",
+    "feeding_young": "Feeding young", "carrying_food": "Carrying food",
+    "carrying_fecal_sac": "Carrying fecal sac",
+    "courtship_display_or_copulation": "Courtship or display",
+    "foraging_eating": "Foraging or eating", "preening": "Preening",
+    "molting": "Molting", "vocalizing": "Vocalizing", "flock": "Flock",
+    "multiple_species": "Multiple species", "habitat": "Habitat",
+    "environmental": "Environmental", "in_hand": "In hand", "dead": "Dead",
+    "watermark": "Watermark", "back_of_camera": "Back of camera",
+    "song": "Song (audio)", "call": "Call (audio)",
+    "dawn_song": "Dawn song (audio)", "flight_call": "Flight call (audio)",
+}
+TAG_CHOICES = [
+    app_commands.Choice(name=TAG_LABELS.get(tag, tag), value=tag) for tag in MEDIA_TAGS
+]
+AGE_CHOICES = [app_commands.Choice(name=a.capitalize(), value=a) for a in MEDIA_AGES]
+SEX_CHOICES = [app_commands.Choice(name=s.capitalize(), value=s) for s in MEDIA_SEXES]
+
+
+def search_filters(*pairs) -> dict:
+    """{param: value} for the choices actually set."""
+    return {name: choice.value for name, choice in pairs if choice is not None}
+
 
 def media_value(choice: app_commands.Choice[str] | None, default: str) -> str:
     """The mediaType the API expects; empty string means every kind."""
@@ -734,6 +763,7 @@ async def _send_user_photos(
     species_group: bool = False,
     region: str = "",
     media_type: str = "photo",
+    filters: dict | None = None,
     compact_flag: str | None = None,
     delivery: Delivery | None = None,
 ) -> None:
@@ -748,6 +778,7 @@ async def _send_user_photos(
             species_query=species or None,
             species_group=species_group,
             media_type=media_type,
+            filters=filters,
             region=region,
         )
     except ChecklistError as error:
@@ -759,6 +790,10 @@ async def _send_user_photos(
     )
     if not result.details:
         target = f" of {result.species_display}" if result.species_display else ""
+        if filters:
+            target += " matching " + ", ".join(
+                TAG_LABELS.get(v, v).lower() for v in filters.values()
+            )
         if result.user_id:
             await delivery.notice(
                 f"No public media{target} found for `{result.user_id}` — check the ID, "
@@ -777,7 +812,13 @@ async def _send_user_photos(
         catalog += f"&taxonCode={result.species_code}"
     if result.region:
         catalog += f"&regionCode={result.region}"
+    for name, value in (filters or {}).items():
+        catalog += f"&{name}={value}"
     bits = [f"**{header.format(n=len(result.details), sp=result.species_display)}**"]
+    if filters:
+        bits.append(
+            ", ".join(TAG_LABELS.get(v, v).lower() for v in filters.values())
+        )
     if result.display_name:
         bits.append(result.display_name)
     bits.append(f"[full gallery](<{catalog}>)")
@@ -818,9 +859,15 @@ async def _send_user_photos(
     group="Match every species with this in its name (e.g. all puffins; global if no user)",
     region="Limit species matches and media to a region — code (US-WA) or name (washington)",
     media="Media type to search (default: all media)",
+    tag="Behavior or content tag, e.g. nest, foraging, song, in hand",
+    age="Only media showing birds of this age",
+    sex="Only media showing birds of this sex",
     detail=DETAIL_HELP,
 )
-@app_commands.choices(detail=DETAIL_CHOICES, media=MEDIA_CHOICES)
+@app_commands.choices(
+    detail=DETAIL_CHOICES, media=MEDIA_CHOICES,
+    tag=TAG_CHOICES, age=AGE_CHOICES, sex=SEX_CHOICES,
+)
 async def sp_command(
     interaction: discord.Interaction,
     species: str,
@@ -829,6 +876,9 @@ async def sp_command(
     group: bool = False,
     region: str = "",
     media: app_commands.Choice[str] | None = None,
+    tag: app_commands.Choice[str] | None = None,
+    age: app_commands.Choice[str] | None = None,
+    sex: app_commands.Choice[str] | None = None,
     detail: app_commands.Choice[str] | None = None,
 ) -> None:
     delivery = await defer_privately(interaction)
@@ -837,6 +887,7 @@ async def sp_command(
         interaction, user, count, SORT_BEST,
         f"Top {{n}} highest rated {MEDIA_WORDS[media_type]} for {{sp}}",
         species=species, species_group=group, region=region, media_type=media_type,
+        filters=search_filters(("tag", tag), ("age", age), ("sex", sex)),
         compact_flag=detail_flag(detail), delivery=delivery,
     )
 
