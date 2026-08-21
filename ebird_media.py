@@ -454,19 +454,79 @@ async def resolve_user(text: str, *, session: aiohttp.ClientSession) -> str:
 
 
 async def _find_taxa(
-    query: str, session: aiohttp.ClientSession, *, cat: str = "species", limit: int = 25
+    query: str, session: aiohttp.ClientSession, *, cat: str = "species", limit: int = 25,
+    timeout: float = 25,
 ) -> list[dict]:
     """Raw fuzzy taxon matches [{code, name}, …] for a name query."""
     params = {"locale": "en", "cat": cat, "limit": str(limit), "key": EBIRD_WEB_KEY, "q": query}
     headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
     async with session.get(
         TAXON_FIND_URL, params=params, headers=headers,
-        timeout=aiohttp.ClientTimeout(total=25),
+        timeout=aiohttp.ClientTimeout(total=timeout),
     ) as resp:
         if resp.status != 200:
             raise ChecklistError(f"Species lookup returned HTTP {resp.status} — try again in a minute.")
         matches = await resp.json(content_type=None)
     return matches if isinstance(matches, list) else []
+
+
+_SUGGEST_CACHE: dict[str, tuple[float, list[tuple[str, str]]]] = {}
+SUGGEST_CACHE_SECONDS = 300
+
+
+async def suggest_species(
+    query: str, *, session: aiohttp.ClientSession | None = None, limit: int = 25
+) -> list[tuple[str, str]]:
+    """(display name, common name) matches for a partial name or banding code.
+
+    eBird's taxon finder already ranks four-letter banding codes (NOCA, SOSP,
+    BAEA) alongside common and scientific names, so one lookup serves both.
+    Answers are cached for a few minutes because autocomplete fires on every
+    keystroke, and a slow or failed lookup returns nothing rather than raising:
+    Discord drops the suggestion list if it isn't answered in ~3 seconds.
+    """
+    key = " ".join(query.lower().split())
+    if not key:
+        return []
+    now = time.monotonic()
+    cached = _SUGGEST_CACHE.get(key)
+    if cached is not None and now - cached[0] < SUGGEST_CACHE_SECONDS:
+        return cached[1]
+    owns_session = session is None
+    if owns_session:
+        session = aiohttp.ClientSession()
+    try:
+        matches = await _find_taxa(key, session, limit=limit, timeout=2.0)
+    except (ChecklistError, aiohttp.ClientError, asyncio.TimeoutError):
+        return []
+    finally:
+        if owns_session:
+            await session.close()
+    # eBird ranks common-name hits first, so a scientific name typed in full can
+    # land below unrelated species that merely share a word. Lift exact and
+    # prefix matches; everything else keeps eBird's own order (which already
+    # puts the right bird first for banding codes).
+    def rank(match: dict) -> int:
+        common, _, scientific = (match.get("name") or "").partition(" - ")
+        common, scientific = common.lower(), scientific.lower()
+        if key in (common, scientific):
+            return 0
+        if common.startswith(key):
+            return 1
+        if scientific.startswith(key):
+            return 2
+        return 3
+
+    found = []
+    for match in sorted(matches, key=rank):  # stable: ties keep eBird's order
+        name = match.get("name") or ""
+        common = name.partition(" - ")[0]
+        if common:  # value must be the common name: resolve_species exact-matches it
+            found.append((name[:100], common[:100]))
+    if len(_SUGGEST_CACHE) > 200:
+        _SUGGEST_CACHE.clear()  # cheap bound on a keystroke-driven cache
+    _SUGGEST_CACHE[key] = (now, found)
+    return found
 
 
 def _merge_key(sort: str):
@@ -737,6 +797,54 @@ async def _region_taxa(region_code: str, session: aiohttp.ClientSession) -> list
     return taxa
 
 
+def _banding_code(common_name: str) -> str:
+    """The conventional four-letter alpha code for a common name.
+
+    One word takes its first four letters, two words take two each, and three
+    or more take one from each leading word plus two from the last. Hyphens
+    split words as banders treat them, so Red-tailed Hawk is RTHA.
+    """
+    # strip apostrophes and the like inside words rather than dropping the
+    # word, so Ross's Gull derives ROGU and never plain GULL
+    words = [re.sub(r"[^A-Za-z]", "", word) for word in re.split(r"[\s-]+", common_name)]
+    words = [word for word in words if word]
+    if not words:
+        return ""
+    if len(words) == 1:
+        return words[0][:4].upper()
+    if len(words) == 2:
+        return (words[0][:2] + words[1][:2]).upper()
+    if len(words) == 3:
+        return (words[0][:1] + words[1][:1] + words[2][:2]).upper()
+    return "".join(word[:1] for word in words[:4]).upper()
+
+
+def _by_banding_code(query: str, candidates: list[dict]) -> dict | None:
+    """The best candidate whose common name really derives to this alpha code.
+
+    Codes are not unique worldwide (NOCA fits both Northern Cardinal and
+    Northern Cassowary), so ties fall to eBird's own ranking, which puts the
+    commonly meant bird first. The derivation still has to match, so a plain
+    word that happens to be four letters never resolves this way.
+    """
+    code = query.strip()
+    # Banders write codes in capitals, and lowercase words like "crow" or
+    # "dove" would otherwise resolve to whatever species happens to derive
+    # them (CR+OW is Crested Owl). Requiring capitals keeps ordinary searches
+    # on the name path, where an ambiguous word gets a did-you-mean reply.
+    if len(code) != 4 or not code.isalpha() or code != code.upper():
+        return None
+    # "crow" is a word people search, not a code for Crested Owl: if the text
+    # appears as a whole word in any candidate's name, treat it as a name.
+    word = re.compile(rf"\b{re.escape(code)}\b", re.IGNORECASE)
+    if any(word.search(c.get("name", "").partition(" - ")[0]) for c in candidates):
+        return None
+    for candidate in candidates:
+        if _banding_code(candidate.get("name", "").partition(" - ")[0]) == code:
+            return candidate
+    return None
+
+
 async def resolve_species(
     query: str, *, session: aiohttp.ClientSession, regional_taxa: list[dict] | None = None
 ) -> tuple[str, str]:
@@ -751,6 +859,9 @@ async def resolve_species(
     if regional_taxa is not None:
         by_common = [t for t in regional_taxa if lowered in t["name"].partition(" - ")[0].lower()]
         by_sci = [t for t in regional_taxa if lowered in t["name"].partition(" - ")[2].lower()]
+        coded = _by_banding_code(query, regional_taxa)
+        if coded is not None:
+            return coded["code"], coded["name"]
         pool = by_common or by_sci
         if pool:
             for match in pool:
@@ -774,6 +885,9 @@ async def resolve_species(
         common, _, scientific = match["name"].partition(" - ")
         if lowered in (common.lower(), scientific.lower()):
             return match["code"], match["name"]
+    coded = _by_banding_code(query, matches)
+    if coded is not None:
+        return coded["code"], coded["name"]
     if len(matches) == 1:
         return matches[0]["code"], matches[0]["name"]
     more = "+" if len(matches) == 25 else ""
