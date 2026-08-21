@@ -54,6 +54,7 @@ from ebird_media import (
     MEDIA_TAGS,
     region_name,
     resolve_region_code,
+    suggest_species,
     select_fields,
     species_rarity,
 )
@@ -853,7 +854,7 @@ async def _send_user_photos(
     description="Post a user's media of one species (common or scientific name)",
 )
 @app_commands.describe(
-    species="Species — common or scientific name, e.g. 'black oystercatcher'",
+    species="Species: common or scientific name, or banding code (NOCA, SOSP)",
     user="Optional: USER… ID, name, @mention, or their asset link — omit for the global best",
     count="How many to post (1–50, default 10)",
     group="Match every species with this in its name (e.g. all puffins; global if no user)",
@@ -890,6 +891,20 @@ async def sp_command(
         filters=search_filters(("tag", tag), ("age", age), ("sex", sex)),
         compact_flag=detail_flag(detail), delivery=delivery,
     )
+
+
+@sp_command.autocomplete("species")
+async def sp_species_autocomplete(
+    interaction: discord.Interaction, current: str
+) -> list[app_commands.Choice[str]]:
+    """Suggest species by common name, scientific name, or banding code."""
+    text = current.strip()
+    if len(text) < 2:
+        return []  # one letter matches most of the taxonomy; not worth a lookup
+    return [
+        app_commands.Choice(name=display, value=common)
+        for display, common in await suggest_species(text)
+    ][:25]
 
 
 @bot.tree.command(
