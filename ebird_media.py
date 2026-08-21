@@ -65,6 +65,19 @@ RARITY_MIN_EFFORT = 60        # checklists across the sampled days; below this a
                               # county's baseline escalates to its state, etc.
 # eBird's own key for its public web autocomplete widgets (not a personal API key)
 EBIRD_WEB_KEY = "jfekjedvescr"
+# Media-search filters the API genuinely honors (verified: unknown params are
+# ignored silently, and these reject bad values with HTTP 400). Breeding codes
+# are a checklist field, not a media field, so they cannot be filtered here.
+MEDIA_AGES = ("adult", "immature", "juvenile", "unknown")
+MEDIA_SEXES = ("male", "female", "unknown")
+MEDIA_TAGS = (
+    "nest", "egg", "nest_building", "feeding_young", "carrying_food",
+    "carrying_fecal_sac", "courtship_display_or_copulation", "foraging_eating",
+    "preening", "molting", "vocalizing", "flock", "multiple_species", "habitat",
+    "environmental", "in_hand", "dead", "watermark", "back_of_camera",
+    "song", "call", "dawn_song", "flight_call",
+)
+
 SORT_BEST = "rating_rank_desc"     # Macaulay "Best quality" ranking
 SORT_RECENT = "upload_date_desc"   # most recently uploaded
 SORT_OBS = "obs_date_desc"         # most recent observation date/time
@@ -774,7 +787,7 @@ async def resolve_species(
 
 async def _paged_user_search(
     session: aiohttp.ClientSession, user_id: str, *, sort: str, media_type: str = "photo",
-    region_code: str = "",
+    region_code: str = "", filters: dict | None = None,
 ) -> list[dict]:
     """Page through a user's media in server sort order, up to MAX_PHOTOS items.
 
@@ -783,6 +796,7 @@ async def _paged_user_search(
     cursor: str | None = None
     while len(items) < MAX_PHOTOS:
         params: dict = {"userId": user_id, "sort": sort, "count": PAGE_SIZE, "unconfirmed": "incl"}
+        params.update(filters or {})
         if media_type:
             params["mediaType"] = media_type
         if region_code:
@@ -809,6 +823,7 @@ async def fetch_user_details(
     species_group: bool = False,
     media_type: str = "photo",
     region: str = "",
+    filters: dict | None = None,
     session: aiohttp.ClientSession | None = None,
 ) -> UserMedia:
     """A user's public media, ranked by `sort`, optionally one species only.
@@ -838,7 +853,8 @@ async def fetch_user_details(
             needle = species_query.strip().lower()
             species_display = f"“{species_query.strip()}”"
             everything = await _paged_user_search(
-                session, user_id, sort=sort, media_type=media_type, region_code=region_code
+                session, user_id, sort=sort, media_type=media_type,
+                region_code=region_code, filters=filters
             )
             # prefer common-name matches so "puffin" doesn't drag in Puffinus shearwaters
             by_common = [
@@ -884,6 +900,7 @@ async def fetch_user_details(
             async def one_taxon(code: str) -> list[dict]:
                 async with semaphore:
                     params: dict = {"sort": sort, "count": count, "unconfirmed": "incl", "taxonCode": code}
+                    params.update(filters or {})
                     if media_type:
                         params["mediaType"] = media_type
                     if region_code:
@@ -900,6 +917,7 @@ async def fetch_user_details(
                     species_query, session=session, regional_taxa=regional_taxa
                 )
             params: dict = {"sort": sort, "count": count, "unconfirmed": "incl"}
+            params.update(filters or {})
             if user_id:
                 params["userId"] = user_id
             if media_type:
